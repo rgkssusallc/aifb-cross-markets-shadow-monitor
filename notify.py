@@ -210,6 +210,58 @@ class Webhook:
                 self._task.cancel()
             self._task = None
 
+    async def preflight(self) -> tuple[bool, str]:
+        """POST one hello event and say plainly whether it arrived.
+
+        Without this the logger starts happily and accumulates `failed`
+        counts that nobody reads until the run is over -- the worst way to
+        discover that an endpoint was never reachable. The common causes are
+        worth distinguishing, because the fix differs:
+
+          egress proxy 403  -> the host is not in the environment's allowed
+                               domains, or the policy change has not reached
+                               this container yet (it applies at startup)
+          connect refused   -> the tunnel or server is not running
+          401 / 403 body    -> reachable, but the token was rejected
+        """
+        import httpx
+        headers = {"Content-Type": "application/json"}
+        if self.secret:
+            headers["X-Shadow-Token"] = self.secret
+        ev = event("hello", note="preflight from the shadow logger")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s) as c:
+                r = await c.post(self.url, json=ev, headers=headers)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)[:140]
+            # The egress proxy's CONNECT code distinguishes the two causes,
+            # and they need opposite fixes. Verified by probing a host known
+            # to be denied against one known to be allowed:
+            #   403 -> policy denial: the host is not in the allowed domains
+            #   502 -> policy ALLOWS it; nothing is listening upstream
+            # Reporting 502 as a policy problem sends you to change a setting
+            # that is already correct, which is worse than saying nothing.
+            if "403" in msg:
+                return False, (
+                    f"{type(e).__name__}: {msg}\n"
+                    "    -> policy denial. Add this host to the environment's "
+                    "allowed domains. Note a leading '*.' matches subdomains "
+                    "only, not the bare domain."
+                )
+            if "502" in msg:
+                return False, (
+                    f"{type(e).__name__}: {msg}\n"
+                    "    -> the host IS allowed, but nothing answered. Start "
+                    "the tunnel or server and check the URL."
+                )
+            return False, f"{type(e).__name__}: {msg}"
+        if r.status_code in (401, 403):
+            return False, (f"HTTP {r.status_code} -- reachable, but the "
+                           f"endpoint rejected X-Shadow-Token")
+        if r.status_code >= 400:
+            return False, f"HTTP {r.status_code}: {r.text[:100]}"
+        return True, f"HTTP {r.status_code}"
+
     def stats(self) -> str:
         return (f"webhook sent {self.sent} failed {self.failed} "
                 f"dropped {self.dropped}")

@@ -265,6 +265,17 @@ async def main() -> int:
                         webhook=opts.get("webhook"), secret=opts.get("secret"))
     for sk in sink.sinks:
         if isinstance(sk, notify.Webhook):
+            # Prove the endpoint BEFORE spending a run on it. A webhook that
+            # was never reachable looks exactly like a quiet market.
+            ok, detail = await sk.preflight()
+            print(f"  webhook preflight: {'OK' if ok else 'FAILED'}  {detail}")
+            if not ok and opts.get("require-webhook", "0") not in ("0", "false"):
+                print("  --require-webhook set; refusing to start")
+                await engine.aclose()
+                return 3
+            if not ok:
+                print("  continuing anyway: samples still land in the db and "
+                      "jsonl, but the frontend will receive nothing")
             sk.start()
     store = Store(opts.get("db", "monitor.db"))
     mon = Monitor(engine=engine, store=store, size=size,
