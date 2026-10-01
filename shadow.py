@@ -72,8 +72,13 @@ class Watcher:
     token_in: TokenMeta   # the volatile token (WETH)
     token_out: TokenMeta  # the stable token (USDC)
 
+    # "rest" or "ws:<actual product>", so logs from the two feeds never merge
+    # into one distribution -- they differ in staleness and, in WS mode, in
+    # which quote currency Coinbase actually streamed.
+    source: str = "rest"
+
     def key(self, direction: str) -> str:
-        return f"{self.product}:base-v3-{self.tier}:{direction}"
+        return f"{self.product}:base-v3-{self.tier}:{direction}:{self.source}"
 
 
 @dataclass
@@ -85,9 +90,23 @@ class Loop:
     client: object
     quoter: str
     cex_fee: D
+    # When set, the Coinbase book comes from the level2 WebSocket instead of
+    # a REST round trip per poll. The book is then always current and costs
+    # no network to read, so the poll rate is bounded only by the RPC side.
+    feed: object | None = None
+    feed_product: str = ""
 
     sink: notify.Fanout | None = None
     heartbeat_s: float = 2.0
+
+    # A DEX quote cannot change within a block, so it is re-fetched only when
+    # the block number moves. Base blocks arrive every ~2s (measured median
+    # 1994ms) while level2 pushes ~17/s, a 34x mismatch: re-quoting every poll
+    # returns an identical answer and spends four eth_calls to do it.
+    cex_max_age_ms: float = 400.0
+    dex_block: int = 0
+    _dex_legs: tuple = ()
+    dex_requotes: int = 0
 
     polls: int = 0
     errors: int = 0
@@ -110,30 +129,54 @@ class Loop:
         w = self.watcher
         c = self.client
 
-        raw = await self.cb.book(w.product, w.token_in.symbol.lstrip("W"),
-                                 w.token_out.symbol)
-        if raw is None:
-            self.errors += 1
-            return None
-        # Relabel ETH -> WETH so paths close. 1:1 by the WETH contract; the
-        # wrap gas is not counted, nor is any inter-venue transfer.
+        if self.feed is not None:
+            # No round trip: the maintained book is already current. None
+            # means the feed knows it cannot be trusted (sequence gap,
+            # reconnecting, crossed book) -- a silently wrong book is worse
+            # than no book, so skip the poll rather than evaluate garbage.
+            raw = self.feed.book(self.feed_product)  # type: ignore[attr-defined]
+            if raw is None:
+                self.errors += 1
+                return None
+        else:
+            raw = await self.cb.book(w.product, w.token_in.symbol.lstrip("W"),
+                                     w.token_out.symbol)
+            if raw is None:
+                self.errors += 1
+                return None
+        # Relabel so the path closes. ETH -> WETH is 1:1 by the WETH contract
+        # (wrap gas not counted, nor any inter-venue transfer). In WS mode the
+        # feed also rewrites the quote USDC -> USD, so the quote is relabelled
+        # back: measured basis was 0.00bps with no USDC-USD product listed,
+        # i.e. Coinbase treats them as one book. That is an assumption, it is
+        # recorded in the cycle key, and it is worth re-checking if the gross
+        # edge ever lands near the fee total.
         book = Book(w.product, w.token_in.symbol, w.token_out.symbol,
                     raw.bids, raw.asks, raw.ts_local, raw.ts_exchange)
 
-        # One tiny quote per side gives the marginal price, which is all the
-        # gross edge needs. Reference size is the smallest watched size.
-        ref = min(w.sizes)
-        dex_buy = v3_leg(c, self.quoter, w.token_out, w.token_in, w.tier, ref)
-        # dex_buy is USDC->WETH, so its marginal is WETH PER USDC. Converting
-        # the USDC reference size into WETH is a multiply. Dividing here blew
-        # the reference up by ~price^2, which made the "tiny" probe large
-        # enough to move the pool and corrupted the marginal price -- gross
-        # edge then read worse than net, which is arithmetically impossible
-        # and is the signature of a bad baseline.
-        weth_ref = (ref * dex_buy.marginal_out_per_in
-                    if dex_buy.marginal_out_per_in > 0 else ref)
-        dex_sell = v3_leg(c, self.quoter, w.token_in, w.token_out, w.tier,
-                          weth_ref)
+        # One cheap eth_blockNumber decides whether the four quote calls are
+        # needed at all. Within a block the pool state is identical, so a
+        # cached quote is not stale -- it is exact.
+        blk = c.block_number()
+        if blk != self.dex_block or not self._dex_legs:
+            ref = min(w.sizes)
+            dex_buy = v3_leg(c, self.quoter, w.token_out, w.token_in,
+                             w.tier, ref)
+            # dex_buy is USDC->WETH, so its marginal is WETH PER USDC.
+            # Converting the USDC reference size into WETH is a multiply.
+            # Dividing here blew the reference up by ~price^2, which made the
+            # "tiny" probe large enough to move the pool and corrupted the
+            # marginal price -- gross edge then read worse than net, which is
+            # arithmetically impossible and is the signature of a bad baseline.
+            weth_ref = (ref * dex_buy.marginal_out_per_in
+                        if dex_buy.marginal_out_per_in > 0 else ref)
+            dex_sell = v3_leg(c, self.quoter, w.token_in, w.token_out, w.tier,
+                              weth_ref)
+            self._dex_legs = (dex_buy, dex_sell)
+            self.dex_block = blk
+            self.dex_requotes += 1
+        else:
+            dex_buy, dex_sell = self._dex_legs
 
         now = time.time()
         if now - self._gas_at > GAS_REFRESH_S:
@@ -144,7 +187,18 @@ class Loop:
             except Exception:  # noqa: BLE001 -- stale gas beats no sample
                 pass
 
+        # The generic skew guard compares wall-clock timestamps, which is the
+        # right test for two order books and the WRONG one for a mixed path:
+        # a DEX quote from the current block is exact however old it looks,
+        # while a CEX book is dangerous the moment it ages. So each side gets
+        # the guard that actually applies to it, and the generic one is turned
+        # off below by passing max_skew_ms=None.
+        cex_age_ms = (now - book.ts_local) * 1000.0
         skew = abs(dex_buy.ts_local - book.ts_local) * 1000.0
+        if cex_age_ms > self.cex_max_age_ms:
+            for direction in ("dex->cex", "cex->dex"):
+                self.store.record_rejection(w.key(direction), "cex book stale")
+            return None
         cex_sell = BookLeg(book=book, asset_in=w.token_in.symbol,
                            fee_rate=self.cex_fee, venue="coinbase")
         cex_buy = BookLeg(book=book, asset_in=w.token_out.symbol,
@@ -157,7 +211,7 @@ class Loop:
             for size in w.sizes:
                 r = evaluate(path, size, fixed_cost_usd=self.gas_usd,
                              start_asset_usd_price=D(1),
-                             max_skew_ms=self.cfg.max_skew_ms)
+                             max_skew_ms=None)
                 if not r.ok:
                     self.store.record_rejection(key, r.reason or "unknown")
                     continue
@@ -259,7 +313,8 @@ class Loop:
         t0 = time.time()
         last_report = t0
         print(f"watching {self.watcher.product} <-> base v3 "
-              f"{self.watcher.tier} | cex fee {self.cex_fee * 10000:.0f}bps | "
+              f"{self.watcher.tier} | src {self.watcher.source} | "
+              f"cex fee {self.cex_fee * 10000:.0f}bps | "
               f"sizes {[f'${s:,.0f}' for s in self.watcher.sizes]}")
         print(f"min_edge {self.cfg.min_edge_bps}bps  "
               f"max_skew {self.cfg.max_skew_ms:.0f}ms  "
@@ -281,7 +336,8 @@ class Loop:
                 rate = self.polls / (now - t0)
                 best = max(self.best_seen.values()) if self.best_seen else D(0)
                 print(f"  {time.strftime('%H:%M:%S')}  {self.polls} polls "
-                      f"({rate:.2f}/s)  best gross so far {best:+.2f}bps  "
+                      f"({rate:.2f}/s)  requotes {self.dex_requotes}  "
+                      f"best gross so far {best:+.2f}bps  "
                       f"open {len(self.open_opps)}  errors {self.errors}")
                 last_report = now
             await asyncio.sleep(self.cfg.poll_interval_s)
@@ -308,7 +364,9 @@ class Loop:
         elapsed = end - t0
         print(f"\n{self.polls} polls in {elapsed:.0f}s "
               f"({self.polls / elapsed if elapsed else 0:.2f}/s), "
-              f"{self.errors} errors")
+              f"{self.errors} errors, {self.dex_requotes} dex requotes "
+              f"({self.polls / self.dex_requotes if self.dex_requotes else 0:.1f} "
+              f"polls per requote)")
         if self.polls:
             print("Sampling rate bounds what you can see: a dislocation "
                   f"shorter than ~{1000 * elapsed / self.polls:.0f}ms can "
@@ -361,12 +419,29 @@ async def amain() -> int:
         if isinstance(s, notify.Webhook):
             s.start()
 
+    feed = None
+    feed_product = ""
+    source = "rest"
+    if opts.get("ws", "").lower() not in ("", "0", "false", "no"):
+        from venues.coinbase_ws import Level2Feed
+        feed = Level2Feed(requested=(product,))
+        await feed.start()
+        feed_product = feed.confirmed[0] if feed.confirmed else product
+        source = f"ws:{feed_product}"
+        if feed.aliased:
+            print(f"WARNING level2 rewrote the product: {feed.aliased}")
+            print(f"  streaming {feed_product}, NOT {product}. The quote "
+                  "currency differs from the on-chain pool's; measured basis "
+                  "was 0.00bps but it is an assumption, not a fact.")
+
     store = Store(cfg.db_path)
     loop = Loop(
         cfg=cfg, store=store,
         watcher=Watcher(product=product, tier=tier, sizes=sizes,
-                        token_in=reg["WETH"], token_out=reg["USDC"]),
+                        token_in=reg["WETH"], token_out=reg["USDC"],
+                        source=source),
         cb=cb, client=client, quoter=quoter,
+        feed=feed, feed_product=feed_product,
         cex_fee=cex_fee_bps / 10000,
         sink=sink if sink.sinks else None,
         heartbeat_s=float(opts.get("heartbeat", "2")),
@@ -386,6 +461,9 @@ async def amain() -> int:
         await loop.run(seconds)
     finally:
         await cb.aclose()
+        if feed is not None:
+            print(f"level2: {feed.status()}")
+            await feed.aclose()
         client.close()
         if loop.sink is not None:
             stats = loop.sink.stats()
