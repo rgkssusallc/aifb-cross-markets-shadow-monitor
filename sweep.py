@@ -21,6 +21,7 @@ import asyncio
 import sys
 from decimal import Decimal as D
 
+from config import INVENTORY_MODES, PRE_POSITIONED, TRANSFER_CYCLE
 from core.engine import Engine
 from venues.cex import CoinbaseVenue
 from venues.univ3 import DEPLOYMENTS, UniV3Venue
@@ -132,6 +133,21 @@ async def main() -> int:
         print(f"best: {best.route.key} ${best.size_usd:,.0f} "
               f"net {e.net_edge_bps:+.2f}bps -> "
               f"{'OPEN' if e.net_edge_bps > 0 else 'CLOSED'}")
+    # A net edge means nothing without saying what it assumed about capital.
+    # Every route above is priced as if inventory were already on both venues;
+    # moving funds per trade adds the overhead below AND requires the gap to
+    # survive tens of seconds rather than milliseconds.
+    if best is not None:
+        net = best.edge.net_edge_bps
+        print("\nthe same number under each inventory assumption:")
+        for m in (PRE_POSITIONED, TRANSFER_CYCLE):
+            adj = net - m.total_overhead_bps()
+            print(f"  {m.name:15s} net {adj:+8.2f}bps   "
+                  f"overhead {m.total_overhead_bps():>5.1f}bps   "
+                  f"gap must last >= {m.min_gap_duration_s}s")
+        print("  (routes above are the pre-positioned case; transfer-cycle "
+              "overhead is from an operator's live measurements)")
+
     print(f"\n{engine.status()}")
     await engine.aclose()
     return 0

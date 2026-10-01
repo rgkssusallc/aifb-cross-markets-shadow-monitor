@@ -89,3 +89,71 @@ class RunConfig:
 def breakeven_bps(legs: int, fee_bps: Decimal) -> Decimal:
     """Round-trip fee cost of an n-leg path. The number you must beat."""
     return Decimal(legs) * fee_bps
+
+
+# --- inventory mode -------------------------------------------------------
+# The single largest term in a cross-venue cost model is not a fee. It is
+# whether funds move per trade or are already sitting on both venues, and
+# until this was made explicit the model here was out by ~29bps -- enough to
+# turn a dead strategy into a live one, in the wrong direction.
+#
+# Numbers below are from an operator running this pair live (Coinbase <-> Sui
+# since 2026-09-29), not from estimates.
+
+@dataclass(frozen=True)
+class InventoryMode:
+    """How capital reaches the two venues, and what that costs.
+
+    min_gap_duration_s is the part that is easy to miss and decides most of
+    the outcome: an opportunity that dies before you can act on it was never
+    yours. Moving funds per trade means only gaps lasting tens of seconds are
+    reachable; pre-positioned inventory means the limit is your round-trip
+    latency instead, which is three orders of magnitude smaller.
+    """
+    name: str
+    # Per-cycle costs that do NOT scale with notional in the same way fees do;
+    # expressed in bps of notional for comparability.
+    withdrawal_deposit_transfer_bps: Decimal
+    # A reserve against adverse movement between quote and fill. This is a
+    # RESERVE, not a measurement: correct when deciding to trade, wrong when
+    # measuring whether edge exists at all. Both are kept so the two
+    # questions do not get confused.
+    slippage_allowance_bps_per_leg: Decimal
+    # How long a dislocation must survive to be capturable in this mode.
+    min_gap_duration_s: Decimal
+    note: str = ""
+
+    def total_overhead_bps(self, legs: int = 2,
+                           include_allowance: bool = True) -> Decimal:
+        out = self.withdrawal_deposit_transfer_bps
+        if include_allowance:
+            out += self.slippage_allowance_bps_per_leg * Decimal(legs)
+        return out
+
+
+# Funds moved Coinbase -> wallet -> Coinbase for each trade. Their measured
+# transfers took 12-53s, so a gap must last roughly half a minute to be
+# captured at all. Their stated break-even on this basis was ~45bps on the
+# engine estimate and ~60bps on the stricter live check.
+TRANSFER_CYCLE = InventoryMode(
+    name="transfer-cycle",
+    withdrawal_deposit_transfer_bps=Decimal("9.2"),
+    slippage_allowance_bps_per_leg=Decimal("10"),
+    min_gap_duration_s=Decimal("30"),
+    note="measured live: transfers took 12-53s; break-even ~45-60bps",
+)
+
+# Inventory already held on both venues. No withdrawal, deposit or transfer
+# per trade, and the binding constraint becomes round-trip latency -- measured
+# here at ~60ms to Coinbase. Their words: "with funds pre-positioned on both
+# venues you could catch much shorter gaps, and far more of the tail becomes
+# reachable."
+PRE_POSITIONED = InventoryMode(
+    name="pre-positioned",
+    withdrawal_deposit_transfer_bps=Decimal("0"),
+    slippage_allowance_bps_per_leg=Decimal("0"),
+    min_gap_duration_s=Decimal("0.06"),
+    note="requires capital idle on both venues; latency-bound, not transfer-bound",
+)
+
+INVENTORY_MODES = {m.name: m for m in (TRANSFER_CYCLE, PRE_POSITIONED)}

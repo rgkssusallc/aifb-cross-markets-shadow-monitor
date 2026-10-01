@@ -124,6 +124,13 @@ class SuiFlowXVenue:
     name: str = "sui:flowx:cetus"
     kind: str = AMM
     sources: tuple[str, ...] = DEFAULT_SOURCES
+    # Sent EXPLICITLY. FlowX's default is 3, and the operator running this
+    # pair live reports that multi-hop has never been verified in a real
+    # transaction -- their live swaps were small and believed single-hop, but
+    # the hop count per transaction was never checked. Measuring a 3-hop route
+    # therefore overstates what is actually executable today, so the default
+    # here is 1 and anything higher is a deliberate choice recorded in the log.
+    max_hops: int = 1
     timeout_s: float = 12.0
     # FALLBACK ONLY. The real fee is summed from the route's per-hop fees in
     # _record_route; this value is used solely if a response carries none.
@@ -260,6 +267,7 @@ class SuiFlowXVenue:
         params = {
             "tokenIn": coin_in, "tokenOut": coin_out, "amountIn": str(raw_in),
             "includeSources": ",".join(sorted(self.sources)),
+            "maxHops": str(self.max_hops),
         }
         try:
             r = await self._client.get(FLOWX_QUOTE_URL, params=params)
@@ -385,6 +393,7 @@ class SuiFlowXVenue:
     def status(self) -> str:
         bits = [f"checkpoint {self.checkpoint:,}", f"quotes {self.quotes_made}",
                 f"sources {'+'.join(self.sources)}"]
+        bits.append(f"maxHops {self.max_hops}")
         if self.last_hops:
             bits.append(f"route {self.last_paths}path/{self.last_hops}hop "
                         f"fee {self.last_fee_rate * Decimal(10000):.1f}bps")
