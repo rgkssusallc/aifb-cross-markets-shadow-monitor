@@ -164,10 +164,51 @@ def client_for(chain_name: str, **kw: Any) -> RpcClient:
 # expectation is.
 CANDIDATES: dict[str, dict[str, tuple[str, str]]] = {
     "base": {
+        # Both confirmed live by on-chain symbol() and decimals().
         "WETH": ("0x4200000000000000000000000000000000000006", "WETH"),
         "USDC": ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "USDC"),
     },
 }
+
+
+@dataclass(frozen=True)
+class V3Deployment:
+    """Uniswap v3 contract addresses for one chain."""
+    factory: str
+    quoter: str
+
+
+# Base's addresses were validated by a chain that fails loudly if any link is
+# wrong: both have code, factory.getPool() returns non-zero pools at the 100,
+# 500 and 3000 fee tiers, each pool's token0()/token1() match WETH/USDC, and
+# the quoter's marginal price agreed with the pool's OWN slot0 sqrtPriceX96
+# price to within 0.03bps. That last check is the important one -- it is an
+# independent code path, so agreement to a fraction of a basis point confirms
+# the QuoterV2 struct field order, the decimals handling and the fee division
+# all at once. A wrong field order would be off by orders of magnitude.
+V3_DEPLOYMENTS: dict[str, V3Deployment] = {
+    "base": V3Deployment(
+        factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+        quoter="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+    ),
+}
+
+
+def v3_deployment(chain_name: str) -> V3Deployment:
+    """Validated v3 addresses for a chain, or a loud error.
+
+    Unlisted chains raise rather than falling back to another chain's
+    addresses, which on a different network would be either a codeless
+    address or, worse, an unrelated live contract.
+    """
+    d = V3_DEPLOYMENTS.get(chain_name)
+    if d is None:
+        raise EvmError(
+            f"no validated Uniswap v3 deployment recorded for {chain_name!r}; "
+            f"known: {', '.join(sorted(V3_DEPLOYMENTS)) or '(none)'}. "
+            "Resolve and validate the addresses before quoting."
+        )
+    return d
 
 
 # --- JSON-RPC -------------------------------------------------------------
@@ -638,6 +679,37 @@ def v3_leg(
         ts_local=time.time(),
         venue=f"{client.chain.name}:v3:{fee_bps_raw}",
     )
+
+
+# --- gas ------------------------------------------------------------------
+
+# Rough gas for a single Uniswap v3 exactInputSingle, and for two swaps in one
+# transaction (the atomic arb case). Real usage depends on how many ticks the
+# swap crosses, so these are deliberately on the generous side.
+GAS_ONE_SWAP = 180_000
+GAS_TWO_SWAPS = 260_000
+
+
+def measure_gas_usd(
+    client: RpcClient, gas_units: int, native_usd: Decimal
+) -> Decimal:
+    """Live gas cost in USD for a transaction of gas_units.
+
+    Replaces Chain.gas_usd, which is an unmeasured placeholder. native_usd is
+    the chain's gas token in USD -- on an ETH L2 that is the ETH price, which
+    the WETH/USDC quote already gives you, so this needs no price feed.
+
+    Measured on Base at 0.006 gwei this comes to well under a cent, which
+    makes gas essentially irrelevant there: the binding cost is the pool fee,
+    not the gas. Do not carry that conclusion to a chain you have not
+    measured, and re-measure when the chain is congested.
+    """
+    if gas_units <= 0:
+        raise EvmError(f"gas_units must be positive, got {gas_units}")
+    if native_usd <= 0:
+        raise EvmError(f"native_usd must be positive, got {native_usd}")
+    gas_price_wei = int(client.rpc("eth_gasPrice", []), 16)
+    return Decimal(gas_price_wei) * Decimal(gas_units) / Decimal(10) ** 18 * native_usd
 
 
 # --- startup self-check ---------------------------------------------------

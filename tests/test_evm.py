@@ -54,6 +54,8 @@ from venues.evm import (  # noqa: E402
     resolve_v3_pool,
     rpc_url_for,
     selector,
+    measure_gas_usd,
+    v3_deployment,
     to_units,
     v3_leg,
 )
@@ -632,6 +634,42 @@ def test_unknown_chain_is_refused():
             assert "unknown chain" in str(e), e
         else:
             raise AssertionError("an unregistered chain was accepted")
+
+
+# --- 9. Deployments and gas ---------------------------------------------
+
+def test_unvalidated_chain_has_no_v3_deployment():
+    """Falling back to another chain's addresses would, on a different
+    network, be either a codeless address or an unrelated live contract.
+    """
+    v3_deployment("base")          # recorded and validated
+    try:
+        v3_deployment("arc")
+    except EvmError as e:
+        assert "no validated Uniswap v3 deployment" in str(e), e
+    else:
+        raise AssertionError("an unvalidated chain returned v3 addresses")
+
+
+def test_measure_gas_usd_arithmetic():
+    """1 gwei x 200,000 gas x $2,500/ETH = 0.0002 ETH = $0.50."""
+    fake = FakeChain()
+    client = mk_client(fake)
+    client.rpc = lambda m, p: hex(10**9)  # type: ignore[method-assign]
+    got = measure_gas_usd(client, 200_000, D("2500"))
+    assert approx(got, "0.5", "0.000001"), got
+
+
+def test_measure_gas_usd_rejects_nonsense_inputs():
+    client = mk_client(FakeChain())
+    client.rpc = lambda m, p: hex(10**9)  # type: ignore[method-assign]
+    for units, px in ((0, D("2500")), (200_000, D("0"))):
+        try:
+            measure_gas_usd(client, units, px)
+        except EvmError:
+            pass
+        else:
+            raise AssertionError(f"accepted gas_units={units} native_usd={px}")
 
 
 def main() -> int:
