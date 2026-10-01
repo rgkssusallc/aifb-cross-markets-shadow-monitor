@@ -35,6 +35,8 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+
+import notify
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal as D
@@ -54,12 +56,25 @@ class Monitor:
     # series is the market, and whether it clears YOUR costs depends on
     # inventory mode, which is a separate question answered at the end.
     open_above_bps: D = D("0")
+    interval_s: float = 1.0
     open_opps: dict[str, OpenOpportunity] = field(default_factory=dict)
     cycles: int = 0
     samples: int = 0
     uncommitted: int = 0
     best_gross: dict[str, D] = field(default_factory=dict)
+    latest: dict[str, dict] = field(default_factory=dict)
+    sink: notify.Fanout | None = None
+    heartbeat_s: float = 5.0
+    summary_s: float = 60.0
+    _last_beat: float = 0.0
+    _last_summary: float = 0.0
     stop: bool = False
+
+    def push(self, ev: dict) -> None:
+        """Fire-and-forget. A missed notification costs less than a missed
+        sample, so the sink never blocks the loop."""
+        if self.sink is not None:
+            self.sink.emit(ev)
 
     async def tick(self) -> None:
         # ALL venues, not just the ageing ones. refresh_volatile() skips
@@ -92,6 +107,13 @@ class Monitor:
             prev = self.best_gross.get(key)
             if prev is None or e.gross_edge_bps > prev:
                 self.best_gross[key] = e.gross_edge_bps
+            self.latest[key] = {
+                "route": key, "size_usd": self.size,
+                "gross_bps": e.gross_edge_bps, "net_bps": e.net_edge_bps,
+                "fee_bps": e.fee_bps, "slip_bps": e.slippage_bps,
+                "gas_bps": e.fixed_cost_bps,
+                "assumptions": list(r.assumptions),
+            }
 
             breakdown = {"gross": e.gross_edge_bps, "fee": e.fee_bps,
                          "slippage": e.slippage_bps, "fixed": e.fixed_cost_bps}
@@ -106,16 +128,58 @@ class Monitor:
                         peak_edge_bps=e.gross_edge_bps,
                         peak_breakdown=breakdown,
                         last_edge_bps=e.gross_edge_bps)
+                    self.push(notify.event(
+                        "open", id=key, route=key, size_usd=self.size,
+                        gross_bps=e.gross_edge_bps, net_bps=e.net_edge_bps))
                 else:
                     opp.observe(e.gross_edge_bps, breakdown, 0.0,
                                 e.exhausted, None)
             elif key in self.open_opps:
-                self.store.record_opportunity(self.open_opps.pop(key), now)
+                opp = self.open_opps.pop(key)
+                self.store.record_opportunity(opp, now)
+                self.push(notify.event(
+                    "close", id=key, route=key, size_usd=self.size,
+                    lifetime_ms=round((now - opp.t_open) * 1000.0, 1),
+                    peak_gross_bps=opp.peak_edge_bps, samples=opp.samples))
 
         if self.uncommitted >= 200:
             self.store.conn.commit()
             self.uncommitted = 0
         self.cycles += 1
+
+        if now - self._last_beat >= self.heartbeat_s:
+            self._last_beat = now
+            self.push(notify.event(
+                "heartbeat", cycles=self.cycles, samples=self.samples,
+                open_count=len(self.open_opps),
+                best_gross_bps=max(self.best_gross.values())
+                if self.best_gross else D(0),
+                routes=list(self.latest.values())))
+        # The distribution is what a dashboard should actually show: an
+        # instantaneous gross number means little, the percentile tail is the
+        # thing that decides whether the strategy exists.
+        if now - self._last_summary >= self.summary_s:
+            self._last_summary = now
+            self.store.conn.commit()
+            self.push(notify.event("summary", **self.percentiles()))
+
+    def percentiles(self) -> dict:
+        out: dict[str, dict] = {}
+        c = self.store.conn.cursor()
+        for (key,) in c.execute(
+                "SELECT DISTINCT cycle_key FROM edge_samples"):
+            row = {}
+            for label, q in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+                v = self.store._pctile("gross_bps", key, q)
+                if v is not None:
+                    row[label] = round(v, 2)
+            mx, n = c.execute(
+                "SELECT MAX(gross_bps), COUNT(*) FROM edge_samples "
+                "WHERE cycle_key=?", (key,)).fetchone()
+            row["max"] = round(mx, 2) if mx is not None else None
+            row["samples"] = n
+            out[key] = row
+        return {"gross_bps_by_route": out}
 
     async def run(self, seconds: float) -> None:
         t0 = time.time()
@@ -126,6 +190,8 @@ class Monitor:
             except Exception as e:  # noqa: BLE001 -- one bad cycle is not fatal
                 print(f"  cycle error: {type(e).__name__}: {str(e)[:90]}")
             now = time.time()
+            if self.interval_s:
+                await asyncio.sleep(self.interval_s)
             if now - last >= 20.0:
                 best = max(self.best_gross.values()) if self.best_gross else D(0)
                 print(f"  {time.strftime('%H:%M:%S')}  {self.cycles} cycles  "
@@ -195,8 +261,17 @@ async def main() -> int:
         await engine.aclose()
         return 2
 
+    sink = notify.build(status=opts.get("status"), jsonl=opts.get("jsonl"),
+                        webhook=opts.get("webhook"), secret=opts.get("secret"))
+    for sk in sink.sinks:
+        if isinstance(sk, notify.Webhook):
+            sk.start()
     store = Store(opts.get("db", "monitor.db"))
-    mon = Monitor(engine=engine, store=store, size=size)
+    mon = Monitor(engine=engine, store=store, size=size,
+                  sink=sink if sink.sinks else None,
+                  interval_s=float(opts.get("interval", "1.0")),
+                  heartbeat_s=float(opts.get("heartbeat", "5")),
+                  summary_s=float(opts.get("summary", "60")))
 
     def handle(*_: object) -> None:
         mon.stop = True
@@ -212,6 +287,11 @@ async def main() -> int:
         await mon.run(seconds)
     finally:
         await engine.aclose()
+        if mon.sink is not None:
+            st = mon.sink.stats()
+            await mon.sink.aclose()
+            if st:
+                print(f"notify: {st}")
         print()
         print(store.distribution())
         print(lifetime_report(store))
