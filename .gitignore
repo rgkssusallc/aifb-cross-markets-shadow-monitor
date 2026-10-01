@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+shadow.db
+shadow.db-wal
+shadow.db-shm
+.env
+*.db
+.venv/
