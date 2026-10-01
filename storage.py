@@ -70,6 +70,26 @@ CREATE TABLE IF NOT EXISTS peg_watch (
     ts        REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_peg ON peg_watch(asset, ts);
+
+-- Every evaluation, profitable or not. The `opportunities` table above only
+-- holds positive-net events, so on a pair that never pays it stays empty and
+-- the log says nothing -- you cannot tell "no edge ever existed" from "the
+-- logger was broken", and you cannot tell being 2bps short from 200bps short.
+-- This table is the distribution: it answers how close the market came, how
+-- often, and for how long.
+CREATE TABLE IF NOT EXISTS edge_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    cycle_key   TEXT NOT NULL,
+    size_usd    REAL NOT NULL,
+    gross_bps   REAL NOT NULL,
+    net_bps     REAL NOT NULL,
+    fee_bps     REAL,
+    slip_bps    REAL,
+    skew_ms     REAL,
+    exhausted   INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_samp ON edge_samples(cycle_key, ts);
 """
 
 
@@ -160,6 +180,80 @@ class Store:
         )
         self.conn.commit()
 
+    def record_sample(self, cycle_key: str, size_usd: Decimal,
+                      gross_bps: Decimal, net_bps: Decimal, *,
+                      fee_bps: Decimal | None = None,
+                      slip_bps: Decimal | None = None,
+                      skew_ms: float = 0.0, exhausted: bool = False,
+                      ts: float | None = None, commit: bool = False) -> None:
+        """Log one evaluation regardless of sign.
+
+        Not committed by default: at a few samples a second, a commit per row
+        dominates the poll loop and slows the very sampling rate that decides
+        whether brief dislocations are visible at all. The caller commits in
+        batches.
+        """
+        self.conn.execute(
+            """INSERT INTO edge_samples
+               (ts, cycle_key, size_usd, gross_bps, net_bps, fee_bps, slip_bps,
+                skew_ms, exhausted)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (ts if ts is not None else time.time(), cycle_key, _f(size_usd),
+             _f(gross_bps), _f(net_bps), _f(fee_bps), _f(slip_bps), skew_ms,
+             1 if exhausted else 0),
+        )
+        if commit:
+            self.conn.commit()
+
+    def _pctile(self, column: str, cycle_key: str, q: float) -> float | None:
+        """Percentile by OFFSET; SQLite has no percentile function."""
+        row = self.conn.execute(
+            f"""SELECT {column} FROM edge_samples WHERE cycle_key = ?
+                ORDER BY {column}
+                LIMIT 1 OFFSET
+                  CAST((SELECT COUNT(*) FROM edge_samples WHERE cycle_key = ?)
+                       * ? AS INTEGER)""",
+            (cycle_key, cycle_key, q),
+        ).fetchone()
+        return row[0] if row else None
+
+    def distribution(self) -> str:
+        """How close the market came, per path. The go/no-go read.
+
+        Read the gross column: that is the market. If its maximum never
+        approaches your fee total, the strategy is not short on execution, it
+        is short on opportunity, and no amount of speed will fix it.
+        """
+        c = self.conn.cursor()
+        n, = c.execute("SELECT COUNT(*) FROM edge_samples").fetchone()
+        if not n:
+            return ("no samples logged -- run shadow.py first. An empty log is "
+                    "not evidence of no edge.")
+        out = [f"edge samples: {n:,}"]
+        for key, cnt, lo, hi, avg in c.execute(
+            """SELECT cycle_key, COUNT(*), MIN(ts), MAX(ts), AVG(gross_bps)
+               FROM edge_samples GROUP BY cycle_key ORDER BY COUNT(*) DESC"""
+        ):
+            span = (hi - lo) / 60.0
+            out.append(f"\n{key}   {cnt:,} samples over {span:.1f} min")
+            for label, col in (("gross", "gross_bps"), ("net  ", "net_bps")):
+                p50 = self._pctile(col, key, 0.50)
+                p95 = self._pctile(col, key, 0.95)
+                p99 = self._pctile(col, key, 0.99)
+                mx, = c.execute(
+                    f"SELECT MAX({col}) FROM edge_samples WHERE cycle_key = ?",
+                    (key,)).fetchone()
+                out.append(
+                    f"  {label}  p50 {p50:+8.2f}  p95 {p95:+8.2f}  "
+                    f"p99 {p99:+8.2f}  max {mx:+8.2f}  bps"
+                )
+            pos, = c.execute(
+                "SELECT COUNT(*) FROM edge_samples WHERE cycle_key=? AND net_bps>0",
+                (key,)).fetchone()
+            out.append(f"  net > 0 in {pos:,}/{cnt:,} samples "
+                       f"({100.0 * pos / cnt:.3f}%)")
+        return "\n".join(out)
+
     def record_peg(self, asset: str, venue: str, mid: Decimal,
                    dev_bps: Decimal) -> None:
         self.conn.execute(
@@ -233,6 +327,8 @@ def main() -> None:
     import sys
     path = sys.argv[1] if len(sys.argv) > 1 else "shadow.db"
     store = Store(path)
+    print(store.distribution())
+    print()
     print(store.summary())
     store.close()
 
