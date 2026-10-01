@@ -233,6 +233,36 @@ class Engine:
                 out.append(await self.evaluate_route(route, size))
         return out
 
+    def control_check(self, results: list[RouteResult]) -> list[str]:
+        """Self-test: a same-venue round trip cannot have positive gross edge.
+
+        Buying and selling the same asset at the same venue must lose at
+        least its spread before any cost. A positive gross there is not a
+        market observation, it is proof the frictionless baseline for that
+        venue is wrong -- and a wrong baseline misattributes cost between the
+        fee and slippage columns on every cross-venue route too.
+
+        This caught a real error: an aggregator's "marginal price" taken from
+        a tiny-size quote is not a pool price at all. A small order can be
+        routed through entirely different hops than a large one, so the two
+        directions' tiny quotes are not reciprocal and their product implies
+        free money. An aggregator cannot report its own frictionless price;
+        only a direct pool read can.
+        """
+        problems: list[str] = []
+        for r in results:
+            if r.route.cross_venue_kind != "same" or not r.ok:
+                continue
+            assert r.edge is not None
+            if r.edge.gross_edge_bps > Decimal("0.01"):
+                problems.append(
+                    f"{r.route.buy_on}: same-venue round trip shows gross "
+                    f"{r.edge.gross_edge_bps:+.2f}bps at ${r.size_usd:,.0f}. "
+                    "Impossible -- that venue's frictionless baseline is "
+                    "wrong, so its fee/slippage split cannot be trusted."
+                )
+        return problems
+
     def status(self) -> str:
         lines = [f"engine: {self.evaluated} evaluated, {self.rejected} rejected, "
                  f"{self.cache.stats()}"]

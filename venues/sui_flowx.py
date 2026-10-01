@@ -125,10 +125,20 @@ class SuiFlowXVenue:
     kind: str = AMM
     sources: tuple[str, ...] = DEFAULT_SOURCES
     timeout_s: float = 12.0
-    # Cetus's own pool fee is already inside the FlowX amountOut, so the fee
-    # term is carried here only to split the decomposition; the tiny-probe
-    # baseline divides it back out exactly as the v3 venue does.
-    pool_fee_rate: Decimal = Decimal("0.0025")
+    # FALLBACK ONLY. The real fee is summed from the route's per-hop fees in
+    # _record_route; this value is used solely if a response carries none.
+    # It was originally set to 25bps as a guess, which measurement showed to
+    # be 5x the direct pool's 5bps and 3.5x a measured 3-hop route's 7bps.
+    pool_fee_rate: Decimal = Decimal("0.0007")
+
+    # Route shape from the last quote, recorded because it is a RISK
+    # disclosure, not a detail: a 3-hop route through two thin intermediate
+    # assets is not the same instrument as a direct swap, even when the
+    # output is a tenth of a basis point better.
+    last_hops: int = 0
+    last_paths: int = 0
+    last_intermediates: tuple[str, ...] = ()
+    last_fee_rate: Decimal = Decimal(0)
 
     rpc_url: str = ""
     checkpoint: int = 0
@@ -271,6 +281,41 @@ class SuiFlowXVenue:
         self.quotes_made += 1
         return data
 
+    def _record_route(self, data: dict) -> Decimal:
+        """Read the route's real fee total and shape out of the response.
+
+        The pool fee CANNOT be a constant for an aggregator. A measured route
+        was SUI -> CERT -> BUCK -> USDC with per-hop fees of 100, 500 and 100
+        over a denominator of 1e6: 7bps across three hops, not the 25bps this
+        venue originally hardcoded and not the 5bps of the direct pool. Which
+        hops get chosen changes with size, so the fee changes with size, and
+        the only honest source for it is the route itself.
+        """
+        paths = data.get("paths") or []
+        total_fee = Decimal(0)
+        hops = 0
+        inter: list[str] = []
+        for path in paths:
+            for hop in path:
+                hops += 1
+                extra = hop.get("extra") or {}
+                fee = extra.get("fee")
+                denom = extra.get("feeDenominator")
+                if fee is not None and denom:
+                    total_fee += Decimal(int(fee)) / Decimal(int(denom))
+                out_t = hop.get("tokenOut", "")
+                if out_t and out_t != USDC_COIN:
+                    short = out_t.partition("::")[2] or out_t
+                    if short not in inter:
+                        inter.append(short)
+        self.last_paths = len(paths)
+        self.last_hops = hops
+        self.last_intermediates = tuple(inter)
+        # Fees across hops compound rather than add, but at single-digit bps
+        # the difference is below the noise; summing is the conservative read.
+        self.last_fee_rate = total_fee
+        return total_fee
+
     def _check_sane(self, price: Decimal) -> None:
         """Reject the 2.8%-off glitch rather than logging it as an edge."""
         if self._ref_price is None:
@@ -305,6 +350,7 @@ class SuiFlowXVenue:
             self._last_err = str(e)[:140]
             return None
 
+        fee_rate = self._record_route(real)
         real_out = from_raw(int(real["amountOut"]), do)
         tiny_out = from_raw(int(tiny["amountOut"]), do)
         tiny_in = from_raw(tiny_raw, di)
@@ -315,7 +361,12 @@ class SuiFlowXVenue:
         # Divide the pool fee back out of the negligible-size quote to recover
         # the frictionless baseline netedge.py needs, exactly as the v3 venue
         # does with QuoterV2.
-        marginal = (tiny_out / tiny_in) / (Decimal(1) - self.pool_fee_rate)
+        # Baseline uses the TINY route's own fee, since a small order may be
+        # routed differently from a large one and therefore pay a different
+        # fee total. Falling back to the configured default only if the
+        # response carried no per-hop fees at all.
+        tiny_fee = self._record_route(tiny) or self.pool_fee_rate
+        marginal = (tiny_out / tiny_in) / (Decimal(1) - tiny_fee)
         try:
             self._check_sane(marginal if asset_in == "SUI" else Decimal(1) / marginal)
         except SuiError as e:
@@ -325,7 +376,7 @@ class SuiFlowXVenue:
         return QuotedLeg(
             asset_in=asset_in, asset_out=asset_out,
             marginal_out_per_in=marginal,
-            fee_rate=self.pool_fee_rate,
+            fee_rate=fee_rate or self.pool_fee_rate,
             quote_fn=PinnedQuote({size_in: real_out}),
             ts_local=time.time(),
             venue=self.name,
@@ -334,6 +385,11 @@ class SuiFlowXVenue:
     def status(self) -> str:
         bits = [f"checkpoint {self.checkpoint:,}", f"quotes {self.quotes_made}",
                 f"sources {'+'.join(self.sources)}"]
+        if self.last_hops:
+            bits.append(f"route {self.last_paths}path/{self.last_hops}hop "
+                        f"fee {self.last_fee_rate * Decimal(10000):.1f}bps")
+        if self.last_intermediates:
+            bits.append("via " + ",".join(self.last_intermediates))
         if self.glitches_rejected:
             bits.append(f"glitches {self.glitches_rejected}")
         if self.crossed_rejected:

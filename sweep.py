@@ -55,6 +55,13 @@ def build_venues(base: str, quote: str, opts: dict[str, str]) -> list:
     elif kind == "sui":
         from venues.sui_flowx import SuiFlowXVenue
         venues.append(SuiFlowXVenue())
+        # The direct pool read is kept alongside the aggregator, not instead
+        # of it: two independent paths disagreeing is the only way to catch
+        # an aggregator glitch, and a single pool is a sanity bound on what
+        # any route should achieve.
+        if opts.get("direct", "1") not in ("0", "false", "no"):
+            from venues.cetus import CetusVenue
+            venues.append(CetusVenue())
     return venues
 
 
@@ -107,9 +114,19 @@ async def main() -> int:
     for r in sorted(same, key=lambda r: -(r.edge.net_edge_bps if r.ok else worst)):
         print(r.line())
 
+    problems = engine.control_check(results)
+    print()
+    if problems:
+        print("CONTROL CHECK FAILED -- do not trust the fee/slip split on the "
+              "venues named:")
+        for p in problems:
+            print(f"  ! {p}")
+        print()
+    else:
+        print("control check: all same-venue round trips negative, as they must be\n")
+
     best = max((r for r in results if r.ok),
                key=lambda r: r.edge.net_edge_bps, default=None)
-    print()
     if best is not None:
         e = best.edge
         print(f"best: {best.route.key} ${best.size_usd:,.0f} "
