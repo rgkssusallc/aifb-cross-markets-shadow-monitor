@@ -27,6 +27,7 @@ facts; they are starting guesses that must survive validation.
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -85,22 +86,77 @@ class Chain:
     """
     name: str
     chain_id: int
-    # Fixed USD cost of landing one swap transaction here. Measured, not
-    # guessed: this is the term that sets the minimum profitable size.
+    # Fixed USD cost of landing one swap transaction here. This is the term
+    # that sets the minimum profitable size, so a wrong value here silently
+    # moves the threshold below which every on-chain path loses money.
     gas_usd: Decimal
+    # False means gas_usd is an UNMEASURED placeholder. Nothing stops you
+    # quoting with it, but no on-chain go/no-go decision should rest on it
+    # until it has been measured on the actual swap path.
+    gas_measured: bool = False
 
 
+# chain_id values below were read from each RPC's own eth_chainId, not from
+# memory or a block explorer. ARC and ROBINHOOD were unknown to this project
+# until measured; both are real and distinct.
 BASE = Chain("base", 8453, Decimal("0.02"))
 ARBITRUM = Chain("arbitrum", 42161, Decimal("0.05"))
 OPTIMISM = Chain("optimism", 10, Decimal("0.03"))
+ARC = Chain("arc", 5042, Decimal("0.02"))
+ROBINHOOD = Chain("robinhood", 4663, Decimal("0.02"))
 
-CHAINS = {c.name: c for c in (BASE, ARBITRUM, OPTIMISM)}
+CHAINS = {c.name: c for c in (BASE, ARBITRUM, OPTIMISM, ARC, ROBINHOOD)}
 
-# "Arc" was named as a target but is ambiguous -- most likely Circle's EVM L1,
-# which would need its own chain_id and RPC. Left out deliberately rather than
-# guessed at, because a wrong chain_id here fails loudly at validate() and a
-# wrong *name* would quietly quote the wrong network. Add it with a confirmed
-# chain_id before use.
+# Where each chain's RPC URL lives in the environment. Keys are never read
+# from the chain name directly, so a typo gives a clear "not configured"
+# error instead of falling back to some other chain's endpoint.
+RPC_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "base": ("EVM_BASE_RPC_URL",),
+    "arbitrum": ("EVM_ARB_RPC_URL",),
+    "optimism": ("EVM_OPT_RPC_URL",),
+    "arc": ("EVM_ARC_RPC_URL",),
+    "robinhood": ("EVM_ROBIN_RPC_URL",),
+}
+
+# Non-EVM endpoints live here for reference; they need their own adapters and
+# cannot be driven through RpcClient (no eth_call).
+NON_EVM_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "solana": ("NON_EVM_SOL_RPC_URL",),
+    "sui": ("NON_EVM_SUI_RPC_URL",),
+}
+
+
+def rpc_url_for(chain_name: str) -> str:
+    """The configured RPC URL for a chain, or a loud error naming the var.
+
+    A generic EVM_RPC_URL is accepted as a last resort, but only when no
+    chain-specific variable is set -- otherwise a single stale generic value
+    would silently serve every chain, which is exactly the wrong-network
+    failure verify_chain_id() exists to catch.
+    """
+    names = RPC_ENV_VARS.get(chain_name, ())
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    generic = os.environ.get("EVM_RPC_URL")
+    if generic:
+        return generic
+    wanted = " or ".join(names) if names else f"(no variable mapped for {chain_name!r})"
+    raise EvmError(
+        f"no RPC URL configured for {chain_name}: set {wanted} "
+        "(or EVM_RPC_URL) in the environment"
+    )
+
+
+def client_for(chain_name: str, **kw: Any) -> RpcClient:
+    """Build a client for a named chain from the environment."""
+    chain = CHAINS.get(chain_name)
+    if chain is None:
+        raise EvmError(
+            f"unknown chain {chain_name!r}; known: {', '.join(sorted(CHAINS))}"
+        )
+    return RpcClient(url=rpc_url_for(chain_name), chain=chain, **kw)
 
 # Starting guesses ONLY. validate() proves or rejects each one against the
 # chain; nothing here is relied upon until it has. Symbols are what we expect
@@ -601,38 +657,36 @@ def preflight(client: RpcClient, expected_tokens: dict[str, tuple[str, str]]
 
 
 def main() -> None:
-    """Smoke test. Needs an RPC URL; no key is stored in this module.
+    """Smoke test. Reads the chain's RPC URL from the environment.
 
-    Usage: EVM_RPC_URL=https://... PYTHONPATH=. python venues/evm.py [chain]
+    Usage: PYTHONPATH=. python venues/evm.py [chain]
+    The URL (and therefore the API key) is never printed -- only the host.
     """
-    import os
     import sys
 
-    url = os.environ.get("EVM_RPC_URL")
-    if not url:
-        print("set EVM_RPC_URL to an RPC endpoint for the chain under test")
-        raise SystemExit(2)
     name = sys.argv[1] if len(sys.argv) > 1 else "base"
-    chain = CHAINS.get(name)
-    if chain is None:
-        print(f"unknown chain {name!r}; known: {', '.join(CHAINS)}")
-        raise SystemExit(2)
-
-    client = RpcClient(url=url, chain=chain)
     try:
+        client = client_for(name)
+    except EvmError as e:
+        print(f"ERROR {e}")
+        raise SystemExit(2) from None
+
+    try:
+        host = client.url.split("/")[2]
         client.verify_chain_id()
-        print(f"chain_id ok ({chain.chain_id})  block {client.block_number():,}  "
-              f"rtt {client.last_rtt_ms:.0f}ms")
+        print(f"{name}: chain_id {client.chain.chain_id} ok via {host}  "
+              f"block {client.block_number():,}  rtt {client.last_rtt_ms:.0f}ms")
+        if not client.chain.gas_measured:
+            print(f"  NOTE gas_usd {client.chain.gas_usd} is an unmeasured "
+                  "placeholder; do not size on-chain paths from it yet")
 
         candidates = CANDIDATES.get(name)
         if not candidates:
-            print(f"no token candidates recorded for {name}; nothing to validate")
+            print(f"  no token candidates recorded for {name}; nothing to validate")
             return
-        reg = TokenRegistry(client)
-        for key, meta in reg.validate(candidates).items():
+        for key, meta in TokenRegistry(client).validate(candidates).items():
             print(f"  validated {key:6s} {meta.symbol:8s} "
                   f"{meta.decimals:2d}dp  {meta.address}")
-        print(f"rtt {client.last_rtt_ms:.0f}ms")
     finally:
         client.close()
 

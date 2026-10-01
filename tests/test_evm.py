@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import contextmanager
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +31,7 @@ from eth_utils import to_checksum_address  # noqa: E402
 
 from venues.evm import (  # noqa: E402
     BASE,
+    CHAINS,
     MIN_TINY_UNITS,
     SEL_DECIMALS,
     SEL_GET_POOL,
@@ -43,12 +45,14 @@ from venues.evm import (  # noqa: E402
     TokenRegistry,
     V3Quoter,
     ZERO_ADDRESS,
+    client_for,
     decode_v3_quote,
     encode_v3_quote,
     from_units,
     load_v2_pool,
     marginal_price_from_tiny,
     resolve_v3_pool,
+    rpc_url_for,
     selector,
     to_units,
     v3_leg,
@@ -542,6 +546,92 @@ def test_v3_leg_rejects_a_codeless_quoter():
         assert "no contract at quoter" in str(e), e
     else:
         raise AssertionError("a codeless quoter was accepted")
+
+
+# --- 8. Chain registry and RPC resolution -------------------------------
+
+def test_measured_chain_ids():
+    """These were read from each RPC's own eth_chainId, not from memory.
+    Pinning them here means a careless edit to the registry fails the suite
+    rather than quietly quoting the wrong network.
+    """
+    assert CHAINS["base"].chain_id == 8453
+    assert CHAINS["arbitrum"].chain_id == 42161
+    assert CHAINS["optimism"].chain_id == 10
+    assert CHAINS["arc"].chain_id == 5042
+    assert CHAINS["robinhood"].chain_id == 4663
+    # Distinctness matters: two chains sharing an id would make the
+    # verify_chain_id() guard useless for both.
+    ids = [c.chain_id for c in CHAINS.values()]
+    assert len(ids) == len(set(ids)), ids
+
+
+def test_gas_costs_are_flagged_unmeasured():
+    """gas_usd sets the minimum profitable size for every on-chain path. None
+    of these have been measured on a real swap yet, so each must advertise
+    that rather than passing as fact.
+    """
+    for name, chain in CHAINS.items():
+        assert not chain.gas_measured, (
+            f"{name} claims measured gas -- update this test when it truly is"
+        )
+
+
+@contextmanager
+def only_env(values: dict[str, str]):
+    """Run with ONLY these RPC variables set.
+
+    The real environment has live Alchemy URLs in it, so a test that merely
+    added variables would pass for the wrong reason. Every RPC var is cleared
+    first, then restored.
+    """
+    touched = [k for k in os.environ
+               if k.endswith("_RPC_URL") or k == "EVM_RPC_URL"]
+    saved = {k: os.environ[k] for k in touched}
+    try:
+        for k in touched:
+            del os.environ[k]
+        os.environ.update(values)
+        yield
+    finally:
+        for k in values:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+
+
+def test_rpc_url_resolution_prefers_the_chain_specific_var():
+    with only_env({"EVM_BASE_RPC_URL": "https://base.example/v2/k",
+                   "EVM_RPC_URL": "https://generic.example/v2/k"}):
+        assert rpc_url_for("base") == "https://base.example/v2/k"
+
+
+def test_generic_rpc_url_is_only_a_last_resort():
+    """A single stale generic URL serving every chain is precisely the
+    wrong-network failure the chain_id check exists to catch, so it may only
+    apply when nothing chain-specific is set.
+    """
+    with only_env({"EVM_RPC_URL": "https://generic.example/v2/k"}):
+        assert rpc_url_for("arbitrum") == "https://generic.example/v2/k"
+
+
+def test_missing_rpc_url_names_the_variable():
+    with only_env({}):
+        try:
+            rpc_url_for("optimism")
+        except EvmError as e:
+            assert "EVM_OPT_RPC_URL" in str(e), e
+        else:
+            raise AssertionError("a missing RPC URL resolved to something")
+
+
+def test_unknown_chain_is_refused():
+    with only_env({"EVM_RPC_URL": "https://generic.example/v2/k"}):
+        try:
+            client_for("ethereum")
+        except EvmError as e:
+            assert "unknown chain" in str(e), e
+        else:
+            raise AssertionError("an unregistered chain was accepted")
 
 
 def main() -> int:
