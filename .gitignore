@@ -8,3 +8,4 @@ shadow.db-shm
 .venv/
 screen_result.json
 *.jsonl
+cata-aifb-framework/**/__pycache__/
