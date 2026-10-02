@@ -108,6 +108,10 @@ class UniV3Venue:
     # was the only thing pinning the venue to WETH/USDC.
     base_symbol: str = "WETH"
     quote_symbol: str = "USDC"
+    # Notional (in quote units) at which tiers are compared. Pick it near the
+    # size you intend to trade: the best tier is size-dependent, since fee is
+    # flat and slippage is not.
+    select_size_quote: Decimal = Decimal("1000")
     name: str = ""
     kind: str = AMM
 
@@ -116,6 +120,7 @@ class UniV3Venue:
     deployment: Deployment | None = None
     pool: str = ""
     liquidity: int = 0
+    tier_choice: str = ""
     block: int = 0
     _gas_usd: Decimal = Decimal(0)
     _gas_at: float = 0.0
@@ -154,30 +159,49 @@ class UniV3Venue:
         # a zero-liquidity pool is refused rather than quoted.
         base_t = self.registry[self.base_symbol]
         quote_t = self.registry[self.quote_symbol]
+        # Choose on COST AT SIZE, not on raw liquidity. Picking the deepest
+        # pool sounds right and is not: on Base the WETH/USDC 3000 tier holds
+        # far more liquidity than the 500 tier, but 3000 charges 30bps of fee
+        # and made every WETH route ~2bps worse than a fixed 500 had. Depth
+        # only matters in so far as it reduces slippage, and a tier wins only
+        # if fee PLUS slippage together come out ahead at the size we intend
+        # to trade. Zero-liquidity pools fall out of this for free: they quote
+        # nothing and so can never win.
         tiers = (self.tier,) if self.tier else CANDIDATE_TIERS
-        best: tuple[int, int, str] | None = None
+        best: tuple[int, Decimal, str, int] | None = None
         tried: list[str] = []
         for tier in tiers:
             try:
                 pool = resolve_v3_pool(self.client, d.factory, base_t,
                                        quote_t, tier)
             except EvmError as e:
-                tried.append(f"{tier}: {str(e)[:40]}")
+                tried.append(f"{tier}: {str(e)[:48]}")
                 continue
             try:
                 liq = int.from_bytes(
                     self.client.call(pool, SEL_LIQUIDITY)[:32], "big")
-            except EvmError as e:
+            except EvmError:
                 tried.append(f"{tier}: liquidity() failed")
                 continue
-            tried.append(f"{tier}: liq={liq:,}")
-            if liq > 0 and (best is None or liq > best[1]):
-                best = (tier, liq, pool)
+            if liq <= 0:
+                tried.append(f"{tier}: empty")
+                continue
+            try:
+                probe = v3_leg(self.client, d.quoter, quote_t, base_t,
+                               tier, self.select_size_quote)
+                out = probe.full(self.select_size_quote).amount_out
+            except EvmError as e:
+                tried.append(f"{tier}: quote failed")
+                continue
+            tried.append(f"{tier}: out={out:.6g}")
+            if out > 0 and (best is None or out > best[1]):
+                best = (tier, out, pool, liq)
         if best is None:
             raise EvmError(
-                f"no liquid v3 pool for {self.base_symbol}/{self.quote_symbol} "
+                f"no usable v3 pool for {self.base_symbol}/{self.quote_symbol} "
                 f"on {self.chain} -- tried [{'; '.join(tried)}]")
-        self.tier, self.liquidity, self.pool = best
+        self.tier, _, self.pool, self.liquidity = best
+        self.tier_choice = "; ".join(tried)
         self.name = f"univ3:{self.chain}:{self.tier}"
         self.block = self.client.block_number()
 
@@ -263,6 +287,8 @@ class UniV3Venue:
     def status(self) -> str:
         bits = [f"block {self.block:,}", f"tier {self.tier}",
                 f"liq {self.liquidity:,}", f"gas ${self._gas_usd:.4f}"]
+        if self.tier_choice:
+            bits.append(f"tiers[{self.tier_choice}]")
         if self._last_err:
             bits.append(f"ERR {self._last_err}")
         return "  ".join(bits)
