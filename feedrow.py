@@ -46,7 +46,11 @@ class FeedRow:
     quote: str
     gap_bps: float | None            # gross: the market, before our costs
     net_bps: float | None            # after fees, slippage and gas
-    good_for_usd: float             # capacity: largest size still net-positive
+    # Capacity: the largest size still net-positive. 0.0 means SEARCHED and
+    # there is none, which is the common case. None means the search could not
+    # run -- a different statement, and conflating the two reported "no
+    # capacity" for the one route that had some.
+    good_for_usd: float | None
     buy_at: float | None
     buy_venue: str
     ask_size_usd: float | None      # depth on the side we buy

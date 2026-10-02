@@ -131,10 +131,14 @@ Columns: `asset`/`quote` · `gap_bps` (gross, the market before our costs) ·
 Four things are not guessable from the shape:
 
 - **`good_for_usd` is capacity, not the size quoted** — the largest notional at
-  which net edge is still positive. `0.0` when nothing is profitable, which is
-  a real answer rather than missing data; render it as `—`. It is only searched
-  when the probed size is already net-positive, because solving it costs quotes
-  and there is no point paying to confirm a negative.
+  which net edge is still positive. It is only searched when the probed size is
+  already net-positive, because solving it costs quotes and there is no point
+  paying to confirm a negative. Three states, and they are different claims:
+  a number is the measured capacity; `0.0` means searched and there is none
+  (the common case — render it as `—`); `null` means the search could not run,
+  because the solver re-quotes at trial sizes and a leg that cannot answer one
+  raises. Reporting that failure as `0.0` once said "no capacity" about the
+  only route that had any.
 - **`null` and `0` mean different things.** `null` is *not measurable* — an
   aggregator leg is pinned to the sizes already fetched and genuinely cannot
   answer without more network calls. `0.0` is *measured as zero*. Do not

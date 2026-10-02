@@ -47,7 +47,13 @@ def build_venues(base: str, quote: str, opts: dict[str, str]) -> list:
     """Assemble the venues that could hold this pair."""
     # Coinbase names the volatile asset without the wrapper prefix.
     cb_base = base[1:] if base.startswith("W") and base != "WLD" else base
-    venues: list = [CoinbaseVenue(product=f"{cb_base}-{quote}", use_ws=True)]
+    # Transport is a caller's choice, not a constant. The streaming feed is
+    # right for a long run, and wrong for a one-shot pass over many assets:
+    # a fresh subscription has no book until its level2 snapshot arrives, so
+    # anything evaluating immediately sees age=inf and every route is refused
+    # as stale. REST answers in one request.
+    use_ws = opts.get("ws", "1") not in ("0", "false", "no")
+    venues: list = [CoinbaseVenue(product=f"{cb_base}-{quote}", use_ws=use_ws)]
 
     kind = CHAIN_VENUES_BY_BASE.get(base, DEFAULT_CHAIN_VENUE)
     if kind == "univ3":

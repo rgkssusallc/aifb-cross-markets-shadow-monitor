@@ -56,21 +56,76 @@ DEPLOYMENTS: dict[str, Deployment] = {
         factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
         quoter="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
         tokens={
-            "WETH": ("0x4200000000000000000000000000000000000006", "WETH"),
+            # Every entry below was DISCOVERED and then PROVED, never guessed:
+            #   1. factory PoolCreated logs filtered on USDC -> 10,081 pools
+            #   2. liquidity() on each -> 1,920 with any liquidity at all
+            #   3. symbol()/decimals() on the counterparty token
+            #   4. intersect with Coinbase's 404 tradable USDC spot pairs
+            #   5. PRICE CROSS-CHECK: the pool's own slot0 mid against the
+            #      Coinbase price, keeping only |ratio-1| <= 10%
+            #
+            # Step 5 is load-bearing, not a nicety. Symbol matching is an
+            # IDENTITY GUESS, and the census found 124 distinct Base addresses
+            # claiming the symbol of a Coinbase asset for only 75 assets. A
+            # whole batch of them -- tokens calling themselves BTC, DOGE,
+            # PEPE, SHIB, BONK, TRUMP -- sit in freshly seeded 10000-tier
+            # pools with identical liquidity and prices around 1e-8 USDC.
+            # They are not those assets. A wrong address does not announce
+            # itself: it returns bytes that decode into a plausible price.
+            #
+            # The check also has a KNOWN BLIND SPOT: it cannot separate two
+            # tokens that are both worth about a dollar. The census found a
+            # second address reporting symbol USDT at ratio 1.0003, and the
+            # entry below is the previously validated one, kept deliberately
+            # -- a prior proof outranks a tiebreak on closeness to 1.
+            #
+            # Volumes are Coinbase 24h USD at census time, for ordering only;
+            # connect() re-proves every address at startup regardless.
             "USDC": ("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "USDC"),
-            # Discovered, not guessed: found by reading v3 Swap logs to
-            # identify live pools, then token0()/token1() on those pools, then
-            # symbol()/decimals() on each address. All also listed on
-            # Coinbase, so a cross-venue route exists. connect() re-proves
-            # every one at startup.
-            "SOL": ("0x311935Cd80B76769bF2ecC9D8Ab7635b2139cf82", "SOL"),
-            "USDT": ("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2", "USDT"),
-            "AERO": ("0x940181a94A35A4569E4529A3CDfB74e38FD98631", "AERO"),
-            "MORPHO": ("0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842", "MORPHO"),
-            "ZRO": ("0x6985884C4392D348587B19cb9eAAf157F13271cd", "ZRO"),
-            "VIRTUAL": ("0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", "VIRTUAL"),
-            "VVV": ("0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf", "VVV"),
-            "cbBTC": ("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", "cbBTC"),
+            "WETH": ("0x4200000000000000000000000000000000000006", "WETH"),   # $234.3M/24h
+            "LINK": ("0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196", "LINK"),   # $18.0M/24h
+            "AAVE": ("0x63706e401c06ac8513145b7687A14804d17f814b", "AAVE"),   # $15.9M/24h
+            "UNI": ("0xc3De830EA07524a0761646a6a4e4be0e114a3C83", "UNI"),   # $14.5M/24h
+            "ZRO": ("0x6985884C4392D348587B19cb9eAAf157F13271cd", "ZRO"),   # $13.7M/24h
+            "USDT": ("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2", "USDT"),   # $12.5M/24h
+            "EURC": ("0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42", "EURC"),   # $10.7M/24h
+            "TAO": ("0xf3081494B87e8D5fb7960f066E931D1D0e6E3d67", "TAO"),   # $9.9M/24h
+            "AERO": ("0x940181a94A35A4569E4529A3CDfB74e38FD98631", "AERO"),   # $7.2M/24h
+            "VVV": ("0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf", "VVV"),   # $3.9M/24h
+            "DRV": ("0x9d0E8f5b25384C7310CB8C6aE32C8fbeb645d083", "DRV"),   # $2.9M/24h
+            "MORPHO": ("0xBAa5CC21fd487B8Fcc2F632f3F4E8D37262a0842", "MORPHO"),   # $2.5M/24h
+            "CRV": ("0x8Ee73c484A26e0A5df2Ee2a4960B789967dd0415", "CRV"),   # $1.7M/24h
+            "CBETH": ("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22", "cbETH"),   # $1.4M/24h
+            "SPX": ("0x50dA645f148798F68EF2d7dB7C1CB22A6819bb2C", "SPX"),   # $1.2M/24h
+            "XCN": ("0x9c632E6Aaa3eA73f91554f8A3cB2ED2F29605e0C", "XCN"),   # $1.2M/24h
+            "PENDLE": ("0xA99F6e6785Da0F5d6fB42495Fe424BCE029Eeb3E", "PENDLE"),   # $0.9M/24h
+            "VIRTUAL": ("0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", "VIRTUAL"),   # $0.7M/24h
+            "BASECAT": ("0xB2000000000000000000004c27f6523082f41D01", "Basecat"),   # $0.6M/24h
+            "KTA": ("0xc0634090F2Fe6c6d75e61Be2b949464aBB498973", "KTA"),   # $0.6M/24h
+            "COMP": ("0x9e1028F5F1D5eDE59748FFceE5532509976840E0", "COMP"),   # $0.5M/24h
+            "B3": ("0xB3B32F9f8827D4634fE7d973Fa1034Ec9fdDB3B3", "B3"),   # $0.4M/24h
+            "ZEN": ("0xf43eB8De897Fbc7F2502483B2Bef7Bb9EA179229", "ZEN"),   # $0.3M/24h
+            "EDGE": ("0xED6E000dEF95780fb89734c07EE2ce9F6dcAf110", "EDGE"),   # $0.3M/24h
+            "TOSHI": ("0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4", "TOSHI"),   # $0.3M/24h
+            "COOKIE": ("0xC0041EF357B183448B235a8Ea73Ce4E4eC8c265F", "COOKIE"),   # $0.2M/24h
+            "SUP": ("0xa69f80524381275A7fFdb3AE01c54150644c8792", "SUP"),   # $0.2M/24h
+            "PRO": ("0x18dD5B087bCA9920562aFf7A0199b96B9230438b", "PRO"),   # $0.2M/24h
+            "SUSHI": ("0x7D49a065D17d6d4a55dc13649901fdBB98B2AFBA", "SUSHI"),   # $0.1M/24h
+            "KAT": ("0xD5390300c5DB71F80d46f0fA9983Fc72D4d1e3da", "KAT"),   # $0.1M/24h
+            "PROS": ("0x8B7DdE054BE9D180c1Be7FaE0874697374A49832", "PROS"),   # $0.1M/24h
+            "LMTS": ("0x9EadbE35F3Ee3bF3e28180070C429298a1b02F93", "LMTS"),   # $0.1M/24h
+            "RSR": ("0xaB36452DbAC151bE02b16Ca17d8919826072f64a", "RSR"),   # $0.1M/24h
+            "KAITO": ("0x98d0baa52b2D063E780DE12F615f963Fe8537553", "KAITO"),   # $0.1M/24h
+            "KEYCAT": ("0x9a26F5433671751C3276a065f57e5a02D2817973", "KEYCAT"),   # $0.1M/24h
+            "OPG": ("0xFbC2051AE2265686a469421b2C5A2D5462FbF5eB", "OPG"),   # $0.1M/24h
+            "1INCH": ("0xc5fecC3a29Fb57B5024eEc8a2239d4621e111CBE", "1INCH"),   # $0.0M/24h
+            "DEGEN": ("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed", "DEGEN"),   # $0.0M/24h
+            "FAI": ("0xb33Ff54b9F7242EF1593d2C9Bcd8f9df46c77935", "FAI"),   # $0.0M/24h
+            "MOG": ("0x2Da56AcB9Ea78330f947bD57C54119Debda7AF71", "Mog"),   # $0.0M/24h
+            "RNBW": ("0xa53887F7e7c1bf5010b8627F1C1ba94fE7a5d6E0", "RNBW"),   # $0.0M/24h
+            "CHECK": ("0x9126236476eFBA9Ad8aB77855c60eB5BF37586Eb", "CHECK"),   # $0.0M/24h
+            "SOL": ("0x311935Cd80B76769bF2ecC9D8Ab7635b2139cf82", "SOL"),   # kept: validated earlier
+            "cbBTC": ("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf", "cbBTC"),   # kept: validated earlier
         },
     ),
     "arbitrum": Deployment(
@@ -92,6 +147,12 @@ SEL_LIQUIDITY = selector("liquidity()")
 # Canonical Uniswap v3 tiers. Other factories on the same chain use arbitrary
 # fee values, which is a useful tell that a pool is not ours.
 CANDIDATE_TIERS = (100, 500, 3000, 10000)
+
+# How the native token is priced when the venue's own pair is not WETH/USDC.
+# The 500 tier is the deep WETH/USDC pool on every chain here, and a small
+# probe keeps the marginal price free of impact.
+NATIVE_PRICE_TIER = 500
+NATIVE_PRICE_SIZE_WETH = Decimal("0.01")
 
 
 @dataclass
@@ -252,6 +313,31 @@ class UniV3Venue:
             return None
         return self.registry.tokens.get(symbol)
 
+    async def _native_usd_price(self, leg, asset_in: str,
+                                asset_out: str) -> Decimal:
+        """USD per native token, for costing gas.
+
+        Free when the leg in hand is already WETH/USDC -- its marginal rate is
+        exactly that price, one way up or the other. Otherwise it costs one
+        extra quote a minute, which is the correct price to pay rather than
+        reusing a rate denominated in some other asset.
+        """
+        m = getattr(leg, "marginal_out_per_in", Decimal(0)) or Decimal(0)
+        pair = {asset_in, asset_out}
+        if pair == {"WETH", "USDC"} and m > 0:
+            return m if asset_in == "WETH" else Decimal(1) / m
+        weth, usdc = self.token("WETH"), self.token("USDC")
+        if weth is None or usdc is None or self.deployment is None:
+            return Decimal(0)
+        try:
+            probe = await asyncio.to_thread(
+                v3_leg, self.client, self.deployment.quoter, weth, usdc,
+                NATIVE_PRICE_TIER, NATIVE_PRICE_SIZE_WETH)
+        except EvmError:
+            return Decimal(0)
+        px = getattr(probe, "marginal_out_per_in", Decimal(0)) or Decimal(0)
+        return px if px > 0 else Decimal(0)
+
     async def leg(self, asset_in: str, asset_out: str,
                   size_in: Decimal) -> Leg | None:
         if self.client is None or self.registry is None or self.deployment is None:
@@ -267,13 +353,17 @@ class UniV3Venue:
             self._last_err = str(e)[:120]
             return None
 
-        # Refresh gas off the leg we just built, so no extra price feed is
-        # needed: the WETH/USDC marginal price IS the native token price.
+        # Gas is priced in the NATIVE token, so costing it needs a WETH/USDC
+        # price -- and reading it off whatever leg we happen to have built is
+        # only valid when that leg IS the WETH/USDC pair. For any other pair
+        # the marginal rate is in the wrong units entirely, and the error does
+        # not look like an error: screening MOG/USDC, whose marginal is ~9e6
+        # MOG per USDC, inverted to 1.1e-7 and was passed off as the price of
+        # ETH, which reported gas as -960bps of a $100 trade. The ranking that
+        # number feeds would have been quietly wrong for every non-WETH asset.
         now = time.time()
         if now - self._gas_at > GAS_REFRESH_S:
-            px = (leg.marginal_out_per_in if asset_in == "WETH"
-                  else (Decimal(1) / leg.marginal_out_per_in
-                        if leg.marginal_out_per_in > 0 else Decimal(0)))
+            px = await self._native_usd_price(leg, asset_in, asset_out)
             if px > 0:
                 try:
                     self._gas_usd = await asyncio.to_thread(

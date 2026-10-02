@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import re
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -163,8 +164,12 @@ class Store:
         self.conn.commit()
 
     def record_rejection(self, cycle_key: str, reason: str) -> None:
-        # Reasons carry sizes and timings; bucket them so the table stays small.
-        bucket = reason.split(" ")[0] if reason else "unknown"
+        # Reasons carry sizes and timings, so they are bucketed to keep the
+        # table small -- but ONLY the varying part is dropped. Taking the
+        # first token instead (reason.split(" ")[0]) kept the venue name and
+        # threw the cause away, so every row read "coinbase:LINK-USDC:ws" and
+        # the table could not answer the one question it exists to answer.
+        bucket = re.sub(r"\s*\([^)]*\)", "", reason).strip() or "unknown"
         self.conn.execute(
             """INSERT INTO rejections (cycle_key, reason, n, last_ts)
                VALUES (?,?,1,?)

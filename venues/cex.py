@@ -127,8 +127,36 @@ class CoinbaseVenue:
         return self._book is not None and not self._last_err
 
     def age_ms(self) -> float:
+        """How long since we could last have learned of a change.
+
+        On REST that is simply the age of the snapshot: between polls the book
+        moves and we do not hear about it.
+
+        On the level2 STREAM it is the age of the last message on the
+        connection, NOT the last change to this product's book -- and the
+        difference decides whether thin assets can be measured at all. The
+        channel is a complete, sequence-checked incremental feed, so silence
+        about a product is information: it means that book did not change.
+        Timing from the last mutation instead punishes an asset for being
+        quiet, which is backwards. Measured on one feed carrying ETH, SPX and
+        XCN: contact held at 15-62ms throughout while the two thin books went
+        1,000-1,450ms between updates, so a 400ms limit on mutation age
+        refused SPX and XCN continuously on a connection that was never once
+        unhealthy, and nine of ten candidates logged nothing.
+
+        What genuinely endangers the book -- a dropped message, a sequence
+        gap, a dead socket -- is caught by liveness, which is exactly what
+        last contact measures, with `healthy` covering gaps and resubscribes.
+        """
         if self._book is None:
             return float("inf")
+        if self.feed is not None:
+            if not self.feed.healthy:
+                return float("inf")
+            last = getattr(self.feed, "last_msg_at", 0.0)
+            if last <= 0:
+                return float("inf")
+            return (time.time() - last) * 1000.0
         return (time.time() - self._book.ts_local) * 1000.0
 
     def fixed_cost_usd(self) -> Decimal:

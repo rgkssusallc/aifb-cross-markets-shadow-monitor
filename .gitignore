@@ -6,3 +6,5 @@ shadow.db-shm
 .env
 *.db
 .venv/
+screen_result.json
+*.jsonl
