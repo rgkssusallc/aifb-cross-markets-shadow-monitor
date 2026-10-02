@@ -255,11 +255,32 @@ class Webhook:
                     "the tunnel or server and check the URL."
                 )
             return False, f"{type(e).__name__}: {msg}"
+        body = r.text[:200]
+        # A dev server in front of the API rejects unknown Host headers before
+        # the API ever sees the request, so this 403 is NOT about the token
+        # and NOT about the egress proxy. Hit by the tunnel, which sends the
+        # tunnel hostname as Host.
+        if r.status_code == 403 and "allowedHosts" in body:
+            return False, (
+                "HTTP 403 from a Vite dev server's host check -- the request "
+                "never reached the API.\n"
+                "    -> add the tunnel host to server.allowedHosts in "
+                "vite.config.js (a leading '.' wildcards subdomains, e.g. "
+                "'.trycloudflare.com'), or point the tunnel straight at the "
+                "API port and bypass the dev server entirely."
+            )
+        if r.status_code == 503:
+            return False, (
+                f"HTTP 503: {body}\n"
+                "    -> the endpoint is live but fail-closed, which usually "
+                "means it has no shared secret configured. Set the same "
+                "secret on both sides."
+            )
         if r.status_code in (401, 403):
             return False, (f"HTTP {r.status_code} -- reachable, but the "
-                           f"endpoint rejected X-Shadow-Token")
+                           f"endpoint rejected X-Shadow-Token: {body}")
         if r.status_code >= 400:
-            return False, f"HTTP {r.status_code}: {r.text[:100]}"
+            return False, f"HTTP {r.status_code}: {body}"
         return True, f"HTTP {r.status_code}"
 
     def stats(self) -> str:

@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import sys
 
@@ -261,8 +262,12 @@ async def main() -> int:
         await engine.aclose()
         return 2
 
+    # Prefer the environment. A secret passed as --secret is visible in shell
+    # history and in `ps` output to every user on the box; an env var is not.
     sink = notify.build(status=opts.get("status"), jsonl=opts.get("jsonl"),
-                        webhook=opts.get("webhook"), secret=opts.get("secret"))
+                        webhook=opts.get("webhook"),
+                        secret=(os.environ.get("SHADOW_WEBHOOK_SECRET")
+                                or opts.get("secret")))
     for sk in sink.sinks:
         if isinstance(sk, notify.Webhook):
             # Prove the endpoint BEFORE spending a run on it. A webhook that
