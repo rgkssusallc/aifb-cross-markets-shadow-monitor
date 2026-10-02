@@ -69,6 +69,9 @@ class RouteResult:
     # True when the two legs settle on different chains / venues and therefore
     # need inventory on both sides, or a bridge.
     needs_inventory: bool = True
+    # The legs as evaluated, so a caller can read prices and probe depth
+    # without re-quoting. Kept out of the comparison fields deliberately.
+    legs: tuple = ()
 
     @property
     def ok(self) -> bool:
@@ -205,6 +208,7 @@ class Engine:
             route, size_usd, r, None if r.ok else r.reason,
             assumptions=tuple(a.describe() for a in unproven),
             needs_inventory=True,
+            legs=(leg1, leg2),
         )
 
     async def refresh_volatile(self) -> None:
@@ -231,6 +235,34 @@ class Engine:
                 # Freshen ageing venues per route, not once per sweep.
                 await self.refresh_volatile()
                 out.append(await self.evaluate_route(route, size))
+        return out
+
+    def invariant_check(self, results: list[RouteResult]) -> list[str]:
+        """Terms that cannot have the sign they have.
+
+        Every cost term is non-positive, so gross >= net and slippage <= 0.
+        A POSITIVE slippage is not a market quirk, it is proof that the
+        frictionless baseline for that leg is wrong -- and it was, live: an
+        aggregator's tiny-size probe and its real quote can be routed through
+        DIFFERENT POOLS AT DIFFERENT FEE TIERS, so dividing the probe's fee
+        back out produces a baseline that belongs to a cheaper pool than the
+        one that actually filled. Capping hops does not prevent it; only the
+        pool can report its own pre-fee price.
+
+        When this fires, `net` is still sound (it comes from the real quoted
+        output) but the fee and slippage columns must not be believed.
+        """
+        out: list[str] = []
+        for r in results:
+            if not r.ok:
+                continue
+            assert r.edge is not None
+            if r.edge.slippage_bps > Decimal("0.01"):
+                out.append(
+                    f"{r.route.key}: slippage {r.edge.slippage_bps:+.2f}bps is "
+                    "positive, which is impossible. net is still sound; the "
+                    "fee/slip split is not."
+                )
         return out
 
     def control_check(self, results: list[RouteResult]) -> list[str]:

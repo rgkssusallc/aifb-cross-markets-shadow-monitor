@@ -38,12 +38,14 @@ import signal
 import sys
 
 import notify
+from feedrow import FeedRow, leg_depth, leg_price
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal as D
 
 from config import PRE_POSITIONED, TRANSFER_CYCLE
 from core.engine import Engine
+from netedge import solve_capacity
 from storage import OpenOpportunity, Store
 from sweep import build_venues, parse
 
@@ -67,8 +69,12 @@ class Monitor:
     sink: notify.Fanout | None = None
     heartbeat_s: float = 5.0
     summary_s: float = 60.0
+    feed_s: float = 15.0
     _last_beat: float = 0.0
     _last_summary: float = 0.0
+    _last_feed: float = 0.0
+    rows: dict = field(default_factory=dict)
+    row_errors: int = 0
     stop: bool = False
 
     def push(self, ev: dict) -> None:
@@ -95,6 +101,10 @@ class Monitor:
             key = route.key
             if not r.ok:
                 self.store.record_rejection(key, r.rejected or "unknown")
+                # Still emit a row. A candidate that disappears from the table
+                # reads as a UI bug, and "we could not quote this" is itself
+                # information -- which is why FeedRow carries ok/reason.
+                self.rows[key] = self._row_rejected(route, r)
                 continue
             e = r.edge
             assert e is not None
@@ -108,6 +118,17 @@ class Monitor:
             prev = self.best_gross.get(key)
             if prev is None or e.gross_edge_bps > prev:
                 self.best_gross[key] = e.gross_edge_bps
+            try:
+                self.rows[key] = self._row(route, r, e)
+            except Exception as ex:   # noqa: BLE001 -- a row must never stop a sample
+                # Counted and reported. Swallowing this silently is what made
+                # a one-word NameError look like an unimplemented feature.
+                self.rows.pop(key, None)
+                self.row_errors += 1
+                if self.row_errors <= 2:
+                    print(f"  row build failed ({type(ex).__name__}: "
+                          f"{str(ex)[:80]}); arbfeedall will be incomplete")
+
             self.latest[key] = {
                 "route": key, "size_usd": self.size,
                 "gross_bps": e.gross_edge_bps, "net_bps": e.net_edge_bps,
@@ -159,6 +180,11 @@ class Monitor:
         # The distribution is what a dashboard should actually show: an
         # instantaneous gross number means little, the percentile tail is the
         # thing that decides whether the strategy exists.
+        if now - self._last_feed >= self.feed_s and self.rows:
+            self._last_feed = now
+            self.push(notify.event("arbfeedall",
+                                   size_usd=self.size,
+                                   rows=list(self.rows.values())))
         if now - self._last_summary >= self.summary_s:
             self._last_summary = now
             self.store.conn.commit()
@@ -181,6 +207,80 @@ class Monitor:
             row["samples"] = n
             out[key] = row
         return {"gross_bps_by_route": out}
+
+    def _row_rejected(self, route, r) -> dict:
+        """A candidate that could not be quoted this tick, still as a row.
+
+        Every number is null, because none was measured -- not zero, which
+        would read as "measured and found to be nothing". `reason` carries
+        the engine's rejection verbatim so the table can say WHY instead of
+        just dropping the asset.
+        """
+        return FeedRow(
+            asset=route.base, quote=route.quote,
+            gap_bps=None, net_bps=None, good_for_usd=0.0,
+            buy_at=None, buy_venue=route.buy_on, ask_size_usd=None,
+            sell_at=None, sell_venue=route.sell_on, bid_size_usd=None,
+            venues=f"{route.buy_on}->{route.sell_on}",
+            size_usd=float(self.size),
+            quoted_iso=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            quoted_age_ms=0.0,
+            depth_basis={}, assumptions=[], warnings=[],
+            ok=False, reason=(r.rejected or "unknown")[:160],
+        ).as_dict()
+
+    def _row(self, route, r, e) -> dict:
+        """One table row per candidate. See feedrow.py for the column notes."""
+        buy_v = self.engine.by_name(route.buy_on)
+        sell_v = self.engine.by_name(route.sell_on)
+        l1 = r.legs[0] if getattr(r, "legs", None) else None
+        l2 = r.legs[1] if getattr(r, "legs", None) and len(r.legs) > 1 else None
+
+        # leg_price handles both leg types; a BookLeg has a touch and no
+        # marginal_out_per_in, which is what emptied this column before.
+        buy_at = leg_price(l1) if l1 is not None else None
+        sell_at = leg_price(l2) if l2 is not None else None
+
+        basis: dict = {}
+        ask_sz = bid_sz = None
+        if l1 is not None:
+            ask_sz, basis["ask"] = leg_depth(l1, D(1), self.size)
+        if l2 is not None and sell_at is not None and sell_at > 0:
+            bid_sz, basis["bid"] = leg_depth(l2, sell_at, self.size)
+
+        # Capacity only when there is something to size. Searching to confirm
+        # a negative costs quotes and tells you nothing you do not know.
+        good_for = D(0)
+        if e.net_edge_bps > 0 and r.legs:
+            try:
+                good_for = solve_capacity(
+                    r.legs, lo=self.size, hi=self.size * D(50),
+                    fixed_cost_usd=(buy_v.fixed_cost_usd() if buy_v else D(0))
+                    + (sell_v.fixed_cost_usd() if sell_v else D(0)),
+                    start_asset_usd_price=D(1))
+            except Exception:  # noqa: BLE001
+                good_for = D(0)
+
+        ages = [v.age_ms() for v in (buy_v, sell_v) if v is not None]
+        age = max(ages) if ages else 0.0
+        warn = []
+        if e.slippage_bps > D("0.01"):
+            warn.append("positive slippage: fee/slip split unreliable, net is sound")
+
+        f = lambda x: float(x) if x is not None else None
+        return FeedRow(
+            asset=route.base, quote=route.quote,
+            gap_bps=f(e.gross_edge_bps), net_bps=f(e.net_edge_bps),
+            good_for_usd=float(good_for),
+            buy_at=f(buy_at), buy_venue=route.buy_on, ask_size_usd=f(ask_sz),
+            sell_at=f(sell_at), sell_venue=route.sell_on, bid_size_usd=f(bid_sz),
+            venues=f"{route.buy_on}->{route.sell_on}",
+            size_usd=float(self.size),
+            quoted_iso=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            quoted_age_ms=round(age, 1),
+            depth_basis=basis, assumptions=list(r.assumptions),
+            warnings=warn, ok=True,
+        ).as_dict()
 
     async def run(self, seconds: float) -> None:
         t0 = time.time()
@@ -287,7 +387,8 @@ async def main() -> int:
                   sink=sink if sink.sinks else None,
                   interval_s=float(opts.get("interval", "1.0")),
                   heartbeat_s=float(opts.get("heartbeat", "5")),
-                  summary_s=float(opts.get("summary", "60")))
+                  summary_s=float(opts.get("summary", "60")),
+                  feed_s=float(opts.get("feed", "15")))
 
     def handle(*_: object) -> None:
         mon.stop = True

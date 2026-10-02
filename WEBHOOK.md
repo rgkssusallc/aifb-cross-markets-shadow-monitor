@@ -48,7 +48,7 @@ opportunities from whoever finds it.
   source of truth. The counters are printed on exit
   (`webhook sent N failed N dropped N`) so loss is never silent.
 
-## The four event kinds
+## The five event kinds
 
 Every event carries `kind`, `ts` (epoch seconds, float) and `iso`.
 
@@ -99,6 +99,72 @@ unproven equivalences a route depends on — see below, it belongs on screen.
 
 **This is the one to lead the dashboard with.** See "what to put on screen".
 
+### `arbfeedall` — every candidate as a table row, every `--feed` seconds
+
+A periodic full snapshot of all candidates, profitable or not. The other four
+kinds are unchanged by this one: `open`/`close` remain the thing to alert on,
+`arbfeedall` is for the always-on table.
+
+```json
+{"kind":"arbfeedall","ts":1790903568.0,"iso":"2026-10-02T01:12:48",
+ "size_usd":1000.0,
+ "rows":[{
+  "asset":"SUI","quote":"USDC",
+  "gap_bps":5.72919821994756,"net_bps":-15.001132783080005,
+  "good_for_usd":0.0,
+  "buy_at":1.1688,"buy_venue":"coinbase:SUI-USDC:ws","ask_size_usd":59732.0,
+  "sell_at":1.1690693995200188,"sell_venue":"sui:flowx:cetus","bid_size_usd":null,
+  "venues":"coinbase:SUI-USDC:ws->sui:flowx:cetus",
+  "size_usd":1000.0,
+  "quoted_iso":"2026-10-02T01:12:48","quoted_age_ms":1224.6,
+  "depth_basis":{"ask":"book walked to 10bps",
+                 "bid":"curve: leg cannot quote arbitrary sizes"},
+  "assumptions":["USDC=USD (market, basis +0.00bps)"],
+  "warnings":[],"ok":true,"reason":null}]}
+```
+
+Columns: `asset`/`quote` · `gap_bps` (gross, the market before our costs) ·
+`net_bps` (after fees, slippage and gas — the number to trust) ·
+`good_for_usd` · `buy_at`+`buy_venue` · `ask_size_usd` · `sell_at`+`sell_venue`
+· `bid_size_usd` · `venues` · `quoted_iso`+`quoted_age_ms`.
+
+Four things are not guessable from the shape:
+
+- **`good_for_usd` is capacity, not the size quoted** — the largest notional at
+  which net edge is still positive. `0.0` when nothing is profitable, which is
+  a real answer rather than missing data; render it as `—`. It is only searched
+  when the probed size is already net-positive, because solving it costs quotes
+  and there is no point paying to confirm a negative.
+- **`null` and `0` mean different things.** `null` is *not measurable* — an
+  aggregator leg is pinned to the sizes already fetched and genuinely cannot
+  answer without more network calls. `0.0` is *measured as zero*. Do not
+  coalesce them: a fabricated depth number reads as a measurement, which is
+  worse than a blank.
+- **`ask_size_usd` and `bid_size_usd` share one definition** — USD notional
+  tradeable within 10bps of slippage. It is the only way to put an order book
+  and a bonding curve in the same column, and `depth_basis` says which was
+  used: `book walked to 10bps`, `book: empty`, `book: no touch`,
+  `curve bisected to 10bps`, `curve: >= N at 10bps` (search ceiling hit, so a
+  lower bound), `curve: no price`, `curve: leg cannot quote arbitrary sizes`.
+  Show it on hover over the size cell.
+- **`warnings` are invariant violations where `net_bps` survives.** The one you
+  will see is `positive slippage: fee/slip split unreliable, net is sound`,
+  which fires when an aggregator's tiny probe and its real quote route through
+  different pools at different fee tiers. Render it as a caution, not an error,
+  and do not hide the row.
+
+`ok:false` carries a short `reason` and nulls everywhere else: the route could
+not be quoted this tick. **Keep the row on screen, greyed.** A candidate that
+vanishes reads as a UI bug, and "we could not quote this" is information.
+
+`assumptions` lists the unproven equivalences the row leans on.
+`WETH=ETH (contract, 1:1)` is proven on chain; `USDC=USD (market, basis +Xbps)`
+is not — a positive net that depends on a peg holding is a weaker claim than
+one that does not.
+
+Rows arrive in route-enumeration order, not sorted, and the same `asset`
+appears once per directed venue pair. Sort client-side on `net_bps`.
+
 ## Reference receivers
 
 Express:
@@ -114,6 +180,7 @@ app.post('/api/arb', express.json(), (req, res) => {
     case 'close':     closeExcursion(ev.id, ev.lifetime_ms, ev); break;
     case 'heartbeat': setLiveState(ev); break;
     case 'summary':   setDistribution(ev.gross_bps_by_route); break;
+    case 'arbfeedall': setFeedRows(ev.rows, ev.size_usd); break;
   }
   res.sendStatus(200);            // answer fast; do work asynchronously
 });
@@ -132,6 +199,22 @@ async def arb(ev: dict, x_shadow_token: str = Header(None)):
 
 Answer quickly either way. A slow receiver cannot slow the logger — that was
 tested — but it will fill the queue and start losing events.
+
+**Fail closed when the secret is not configured, and say so with 503.** Both
+receivers above compare against the environment variable directly, so an
+unset `SHADOW_WEBHOOK_SECRET` either throws or — worse, with a `.get()` —
+compares `None` to `None` and accepts everything. Returning 503 instead of
+401 for that case is the better signal, because it separates "this endpoint
+is not configured yet" from "your token is wrong", and those need opposite
+fixes. The logger's preflight distinguishes them and prints the remedy:
+
+| Response | Meaning |
+|---|---|
+| proxy 403 | the host is not in the environment's allowed domains |
+| proxy 502 | the host **is** allowed; nothing is listening upstream |
+| 403 with `allowedHosts` in the body | a Vite dev server rejected the tunnel's `Host` before the API saw it — add the host to `server.allowedHosts`, or point the tunnel at the API port |
+| 503 | endpoint live but fail-closed, usually no secret configured |
+| 401 / 403 | reachable, token rejected |
 
 ## What to put on screen
 
@@ -156,11 +239,16 @@ negative essentially always, which trains you to ignore the screen.
 ## Running it
 
 ```bash
+export SHADOW_WEBHOOK_SECRET=...        # read from the environment, not argv
 PYTHONPATH=. python3 monitor.py --pair=SUI-USDC --size=1000 --seconds=3600 \
-  --webhook=https://your-app/api/arb --secret=$SHADOW_WEBHOOK_SECRET \
+  --webhook=https://your-app/api/arb \
   --jsonl=events.jsonl \
-  --interval=1.0 --heartbeat=10 --summary=120
+  --interval=1.0 --heartbeat=10 --summary=120 --feed=15
 ```
+
+The secret is read from `SHADOW_WEBHOOK_SECRET` rather than a `--secret` flag
+on purpose: anything in argv is visible to every process on the box via `ps`.
+A `--secret` is still accepted as a fallback, but prefer the environment.
 
 `--interval=1.0` is deliberate. FlowX does not rate limit — 60 of 60 requests
 succeeded at every rate tried — but each quote takes ~500ms and a leg needs
