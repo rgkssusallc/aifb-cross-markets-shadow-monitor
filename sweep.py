@@ -30,9 +30,12 @@ from venues.univ3 import DEPLOYMENTS, UniV3Venue
 # this explicit avoids connecting to chains that provably do not hold the
 # pair -- see venues/DISCOVERY.md for what was checked and how.
 CHAIN_VENUES_BY_BASE = {
-    "WETH": "univ3",
     "SUI": "sui",
 }
+# Everything else is tried on the EVM chains; a chain that has not proved the
+# token refuses itself at connect() and is dropped, which is the designed
+# behaviour rather than a special case here.
+DEFAULT_CHAIN_VENUE = "univ3"
 
 
 def parse(argv: list[str]) -> dict[str, str]:
@@ -46,13 +49,15 @@ def build_venues(base: str, quote: str, opts: dict[str, str]) -> list:
     cb_base = base[1:] if base.startswith("W") and base != "WLD" else base
     venues: list = [CoinbaseVenue(product=f"{cb_base}-{quote}", use_ws=True)]
 
-    kind = CHAIN_VENUES_BY_BASE.get(base)
+    kind = CHAIN_VENUES_BY_BASE.get(base, DEFAULT_CHAIN_VENUE)
     if kind == "univ3":
         tiers = tuple(int(x) for x in opts.get("tiers", "500").split(","))
         chains = tuple(opts.get("chains", ",".join(sorted(DEPLOYMENTS))).split(","))
         for chain in chains:
             for tier in tiers:
-                venues.append(UniV3Venue(chain=chain, tier=tier))
+                venues.append(UniV3Venue(chain=chain, tier=tier,
+                                         base_symbol=base,
+                                         quote_symbol=quote))
     elif kind == "sui":
         from venues.sui_flowx import SuiFlowXVenue
         venues.append(SuiFlowXVenue())
