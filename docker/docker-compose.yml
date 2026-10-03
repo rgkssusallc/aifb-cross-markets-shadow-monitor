@@ -1,0 +1,125 @@
+# arb-shadow monitor, for local Docker.
+#
+#   cp docker/.env.example docker/.env     # then edit it
+#   docker compose -f docker/docker-compose.yml up -d --build
+#   docker compose -f docker/docker-compose.yml logs -f
+#
+# One service, because that is genuinely all this is: a long-running outbound
+# worker. No database server (sqlite lives in the volume), no web server, no
+# ports published -- nothing connects IN to it.
+
+name: arb-shadow
+
+services:
+  monitor:
+    build:
+      # Context is the repository root so the Dockerfile can COPY the app.
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: arb-shadow-monitor:local
+    container_name: arb-shadow-monitor
+    restart: unless-stopped
+
+    env_file:
+      # Optional on purpose. A required env_file makes `docker compose up`
+      # fail before it even builds when .env is absent, which is a hostile
+      # first run. Without it the monitor still comes up and measures -- it
+      # just has no webhook and writes to the volume only.
+      - path: .env
+        required: false
+
+    environment:
+      # --- chain endpoints -------------------------------------------------
+      # EVM_BASE_RPC_URL is MANDATORY: every candidate in candidates.py trades
+      # on Base, so without it no route can be quoted and the run ends with
+      # "no pair had two usable venues". entrypoint.sh fails fast on this
+      # rather than letting it look like a quiet market.
+      EVM_BASE_RPC_URL: ${EVM_BASE_RPC_URL:-}
+      # Only WETH uses Arbitrum (its best route is often Base<->Arbitrum).
+      # Leave blank and that venue refuses itself, which is the designed
+      # behaviour, not an error.
+      EVM_ARB_RPC_URL: ${EVM_ARB_RPC_URL:-}
+      # Needed only for the SUI-USDC pair, which is not in the top 10.
+      NON_EVM_SUI_RPC_URL: ${NON_EVM_SUI_RPC_URL:-}
+      # Accepted as a last-resort fallback for any chain without its own
+      # variable. Deliberately a fallback: one stale generic endpoint serving
+      # every chain is the wrong-network failure verify_chain_id() exists to
+      # catch.
+      EVM_RPC_URL: ${EVM_RPC_URL:-}
+
+      # --- what to measure -------------------------------------------------
+      # The measured top N from candidates.py. Set SHADOW_PAIRS to override
+      # with an explicit list, e.g. "WETH-USDC,AERO-USDC".
+      SHADOW_CANDIDATES: ${SHADOW_CANDIDATES:-10}
+      SHADOW_PAIRS: ${SHADOW_PAIRS:-}
+      SHADOW_SIZE_USD: ${SHADOW_SIZE_USD:-1000}
+
+      # --- cadence ---------------------------------------------------------
+      SHADOW_INTERVAL_S: ${SHADOW_INTERVAL_S:-1.0}
+      SHADOW_HEARTBEAT_S: ${SHADOW_HEARTBEAT_S:-5}
+      SHADOW_SUMMARY_S: ${SHADOW_SUMMARY_S:-60}
+      SHADOW_FEED_S: ${SHADOW_FEED_S:-15}
+
+      # --- where events go -------------------------------------------------
+      # On Docker Desktop (Mac/Windows) your own machine is
+      # host.docker.internal, NOT localhost: inside the container localhost is
+      # the container. A webhook pointed at localhost is the single most
+      # common reason a local Docker deployment of this silently delivers
+      # nothing. On Linux, extra_hosts below makes the same name work.
+      SHADOW_WEBHOOK_URL: ${SHADOW_WEBHOOK_URL:-}
+      SHADOW_REQUIRE_WEBHOOK: ${SHADOW_REQUIRE_WEBHOOK:-0}
+      # SHADOW_WEBHOOK_SECRET comes from .env and is read from the environment
+      # by the app, never passed as an argument -- argv is visible in `ps`.
+
+      SHADOW_DATA_DIR: /data
+      SHADOW_STATUS_FILE: /data/status.json
+
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux too, where Docker does not
+      # provide it by default. Harmless on Docker Desktop, which already does.
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # A NAMED volume, not a bind mount, on purpose. The container runs as a
+      # non-root user (uid 10001); a bind-mounted host directory on Linux
+      # arrives owned by the host user, and sqlite then fails to create its
+      # database with a permission error that reads like a code bug. A named
+      # volume has no such ambiguity and works the same on every platform.
+      #
+      # To read the files from the host instead, see "Getting the data out" in
+      # docker/README.md -- or swap this line for `- ./data:/data` and add
+      # `user: "${UID:-1000}:${GID:-1000}"` to this service.
+      - shadow-data:/data
+
+    # No ports. Outbound only.
+
+    # The monitor is network- and latency-bound, not CPU-bound, but a cap
+    # stops a runaway loop from taking the host down with it.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+    logging:
+      # Bounded, or a long measurement run fills the disk with heartbeats.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    stop_grace_period: 30s
+    # Why 30s: on SIGTERM the monitor flushes its open excursions and pushes
+    # the matching `close` events. Killing it sooner leaves excursions that
+    # opened and never closed, so the UI shows them stuck open forever.
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Nothing here needs a capability or a privilege escalation: it opens
+    # outbound TCP and writes to one volume.
+
+volumes:
+  shadow-data:
+    name: arb-shadow-data

@@ -1,0 +1,13 @@
+# Exact pins, matching the versions the 112-test suite passes against.
+httpx==0.28.1
+websockets==17.1
+eth-abi==6.0.0
+eth-utils==6.0.0
+
+# NOT optional, and not obvious: eth-utils' keccak() has no hashing backend of
+# its own. Installing eth-utils alone gives you a keccak that raises
+# "No backend found" the first time an address or selector is derived -- which
+# in this codebase is at venue connect(), i.e. the container starts fine and
+# then dies on its first real work. The extra pins the pycryptodome backend so
+# that cannot happen.
+eth-hash[pycryptodome]==0.8.0
